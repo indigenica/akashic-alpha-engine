@@ -1202,6 +1202,7 @@ if args.mcmc or args.nested:
             
             print(f"\n🔮 Using PARALLEL NESTED SAMPLING (PolyChord, nlive={args.nlive})")
             print(f"   Launching ΛCDM and γCDM-LOG² in separate processes...\n")
+            sampler_name = "NESTED"
             
             script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_nested_single.py")
             python_exe = sys.executable
@@ -1315,6 +1316,7 @@ if args.mcmc or args.nested:
                     # Load LOG2
                     gd_log2 = loadMCSamples("chains/anticheat_log2", settings={'ignore_rows': 0.2})
                     samples_log2 = {p: gd_log2.samples[:, i] for i, p in enumerate(gd_log2.getParamNames().list())}
+                    has_log2_samples = True
                     print("   ✅ Chains loaded successfully")
                 except Exception as e:
                     print(f"   ⚠️ Could not load chains for plotting: {e}")
@@ -1401,50 +1403,54 @@ if args.mcmc or args.nested:
             except Exception as e:
                 print(f"   ⚠️ MPI reset failed: {e}")
 
-        # ── γCDM-LOG² MCMC/Nested (main comparison model) ──
-        print(f"\n⏳ Running γCDM-LOG² {sampler_name}...")
-        log2_p = {**base_params, "gamma_log2": {"prior": {"min": GAMMA_MIN, "max": GAMMA_MAX}, "ref": -1.2, "proposal": 0.05}}
-        if args.asymmetric or args.no_nuisance:
-            if COMBINED_MODE:
-                log2_p["M_sne"] = 0.0
-                log2_p["M_qso"] = 0.0
-            else:
-                log2_p["mabs"] = 0.0
-        log2_p["H0"]["ref"] = 73
-        info_log2 = {"likelihood": {"model": GammaCDM_LOG2_Likelihood}, "theory": {"camb": {"stop_at_error": True}},
-                        "params": log2_p, "sampler": sampler_cfg, "output": "chains/anticheat_log2", "force": True}
-        _, sampler_log2 = run(info_log2)
-        samples_log2 = sampler_log2.products()["sample"]
-        has_log2_samples = True
-        
-        # Extract log-evidence if using nested sampling
-        logZ_log2 = None
-        if args.nested:
-            try:
-                logZ_log2 = sampler_log2.products().get("logZ", None)
-                if logZ_log2 is None:
-                    logZ_log2 = getattr(sampler_log2, 'logZ', None)
-            except:
-                pass
+        # ── γCDM-LOG² MCMC (only when NOT using --nested subprocess mode) ──
+        # ── γCDM-LOG² MCMC (only when NOT using --nested subprocess mode) ──
+        if not args.nested:
+            print(f"\n⏳ Running γCDM-LOG² {sampler_name}...")
+            log2_p = {**base_params, "gamma_log2": {"prior": {"min": GAMMA_MIN, "max": GAMMA_MAX}, "ref": -1.2, "proposal": 0.05}}
+            if args.asymmetric or args.no_nuisance:
+                if COMBINED_MODE:
+                    log2_p["M_sne"] = 0.0
+                    log2_p["M_qso"] = 0.0
+                else:
+                    log2_p["mabs"] = 0.0
+            log2_p["H0"]["ref"] = 73
+            info_log2 = {"likelihood": {"model": GammaCDM_LOG2_Likelihood}, "theory": {"camb": {"stop_at_error": True}},
+                            "params": log2_p, "sampler": sampler_cfg, "output": "chains/anticheat_log2", "force": True}
+            _, sampler_log2 = run(info_log2)
+            samples_log2 = sampler_log2.products()["sample"]
+            has_log2_samples = True
+            
+            # Extract log-evidence if using nested sampling (Legacy check, now handled above)
+            logZ_log2 = None
+            if args.nested:
+                try:
+                    logZ_log2 = sampler_log2.products().get("logZ", None)
+                    if logZ_log2 is None:
+                        logZ_log2 = getattr(sampler_log2, 'logZ', None)
+                except:
+                    pass
 
-        M_log2_mcmc, M_log2_std = _get_M(samples_log2, COMBINED_MODE)
-        gamma0_mcmc = np.mean(samples_log2["gamma_log2"])
-        gamma0_std = np.std(samples_log2["gamma_log2"])
-
-        print(f"\n" + "=" * 70)
-        print(f"📋 {sampler_name.upper()} — γCDM-LOG²")
-        print(f"=" * 70)
-        print(f"   H₀  = {np.mean(samples_log2['H0']):.2f} ± {np.std(samples_log2['H0']):.2f} km/s/Mpc")
-        print(f"   γ₀  = {gamma0_mcmc:.4f} ± {gamma0_std:.4f}")
-        print(f"   δM  = {M_log2_mcmc:.3f} ± {M_log2_std:.3f}")
-        if logZ_log2 is not None:
-            print(f"   log(Z) = {logZ_log2:.2f}")
-
-        beta_m = abs(gamma0_mcmc) * np.log(10) / 5
-        alpha_m = beta_m / 2
-        x_m = (1 - alpha_m) / (1 + alpha_m)
-        spin_m = np.sqrt(1 - x_m**2)
-        print(f"\n   🌀 Spin (MCMC): γ₀ = {gamma0_mcmc:.4f} ± {gamma0_std:.4f} → a/M = {spin_m:.4f}")
+        # Report LOG2 results (whether from MCMC or Nested)
+        if has_log2_samples and samples_log2 is not None:
+             M_log2_mcmc, M_log2_std = _get_M(samples_log2, COMBINED_MODE)
+             gamma0_mcmc = np.mean(samples_log2["gamma_log2"])
+             gamma0_std = np.std(samples_log2["gamma_log2"])
+ 
+             print(f"\n" + "=" * 70)
+             print(f"📋 {sampler_name.upper()} — γCDM-LOG²")
+             print(f"=" * 70)
+             print(f"   H₀  = {np.mean(samples_log2['H0']):.2f} ± {np.std(samples_log2['H0']):.2f} km/s/Mpc")
+             print(f"   γ₀  = {gamma0_mcmc:.4f} ± {gamma0_std:.4f}")
+             print(f"   δM  = {M_log2_mcmc:.3f} ± {M_log2_std:.3f}")
+             if logZ_log2 is not None:
+                 print(f"   log(Z) = {logZ_log2:.2f}")
+ 
+             beta_m = abs(gamma0_mcmc) * np.log(10) / 5
+             alpha_m = beta_m / 2
+             x_m = (1 - alpha_m) / (1 + alpha_m)
+             spin_m = np.sqrt(1 - x_m**2)
+             print(f"\n   🌀 Spin (MCMC): γ₀ = {gamma0_mcmc:.4f} ± {gamma0_std:.4f} → a/M = {spin_m:.4f}")
         
         # ── Bayes Factor Summary (nested sampling only) ──
         if args.nested and logZ_lcdm is not None and logZ_log2 is not None:
