@@ -58,3 +58,26 @@ Verification of the quadratic model and the hardened robustness protocol:
 python gammacdm_addendum_verification.py --starts 5 --mcmc --mock --sigma-int-sne 0.1 --sigma-int-qso 0.4 --qso-err-cut 10.0
 ```
 **Note on Nested Sampling:** The suite supports **PolyChord** for absolute Bayesian Evidence (log Z) calculations. Due to local computational constraints, full Nested Sampling convergence for the 4,007-point dataset was not performed by the author; however, the massive ΔBIC ≈ −699 and MCMC posteriors provide decisive evidence for the model preference.
+
+## Acknowledgements
+
+This work makes use of the following open-source scientific software:
+
+- **Cobaya** — Bayesian Analysis in Cosmology  
+  https://cobaya.readthedocs.io/
+
+- **PolyChord** — Nested Sampling algorithm  
+  https://github.com/PolyChord/PolyChordLite
+
+- **CAMB** — Code for Anisotropies in the Microwave Background  
+  https://camb.info/
+
+- **SciPy** — Scientific computing in Python  
+  https://scipy.org/
+
+- **PySR** — Symbolic Regression for scientific discovery  
+  https://github.com/MilesCranmer/PySR
+
+I am grateful to the authors and maintainers of these tools.
+
+As this work has been developed outside a formal academic setting, the present acknowledgements are intended as a good-faith attribution of the main software dependencies used during its development. A more complete and conventional set of citations and acknowledgements will be provided in any future refined or peer-reviewed version.
