@@ -12,6 +12,15 @@ The results reported in the paper were originally obtained using a custom resear
 ## Addendum Update (Feb 2026)
 The analysis has been refined by incorporating 2,397 high-redshift quasars (z ≤ 7.08), revealing that the lensing effect scales quadratically with the logarithmic expansion: **Δμ = γ₀ · [ln(1+z)]²**. This refined model (**γCDM-LOG²**) achieves a **ΔBIC ≈ −699** against ΛCDM and alleviates the Hubble tension with **H₀ = 73.4 ± 2.1 km/s/Mpc (MCMC)**.
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/ea20f332-56c4-4c30-b468-9ec6072d0aa7" width="46%" />
+  <img src="https://github.com/user-attachments/assets/cf3a529a-5d68-4bff-a789-cfe6ea50eec1" width="50%" />
+</p>
+
+<p align="center">
+  <em><b>Left:</b> Nested posterior distributions for H₀, Ωch², and calibration offsets (δM). <b>Right:</b> Hubble tension alleviation (γCDM-LOG² vs ΛCDM). </em>
+</p>
+
 ## Hardened Robustness Protocol
 To ensure the statistical validity of the results, a validation suite is provided to test the model under a strict anti-cheat protocol:
 *   **Physical Priors:** Enforces **Ωm < 1** (flat ΛCDM with ΩΛ ≥ 0).
