@@ -1,15 +1,14 @@
 # Reproduction Package: Topological Horizon Lensing (γCDM)
 
-**Preprint:** [Topological Horizon Lensing and the Hubble Tension](https://doi.org/10.5281/zenodo.18401999)  
-**Addendum:** [Quadratic Evolution Alleviation of the Hubble Tension](https://doi.org/10.5281/zenodo.18401999)  
+**Preprint:** [Topological Horizon Lensing Framework](https://doi.org/10.5281/zenodo.18401999)  
 **Author:** Bautista, 2026
 
-This repository contains the **reproduction code** and dataset required to independently verify the numerical results, tables, and phenomenological conclusions presented in the associated preprint and the addendum.
+This repository contains the **reproduction code** and dataset required to independently verify the numerical results, tables, and phenomenological conclusions presented in the associated preprint and the addendum. (February 22 version pending upload)
 
 ## Overview
 The results reported in the paper were originally obtained using a custom research framework implemented in JAX, incorporating machine learning–assisted exploration tools (internally referred to as the Akashic Alpha Engine). That framework was used to explore patterns, test phenomenological hypotheses, and guide physical intuition.
 
-## Addendum Update (Feb 2026)
+## Addendum Update (Feb 10, 2026)
 The analysis has been refined by incorporating 2,397 high-redshift quasars (z ≤ 7.08), revealing that the lensing effect scales quadratically with the logarithmic expansion: **Δμ = γ₀ · [ln(1+z)]²**. This refined model (**γCDM-LOG²**) achieves a **ΔBIC ≈ −699** against ΛCDM and alleviates the Hubble tension with **H₀ = 73.4 ± 2.1 km/s/Mpc (MCMC)**.
 
 <p align="center">
