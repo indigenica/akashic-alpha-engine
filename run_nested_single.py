@@ -17,18 +17,23 @@ warnings.filterwarnings('ignore')
 
 # Parse arguments
 parser = argparse.ArgumentParser()
-parser.add_argument("model", choices=["lcdm", "log2"])
+parser.add_argument("model", choices=["lcdm", "log2", "decay", "log_decay"])
 parser.add_argument("--nlive", type=int, default=100)
 parser.add_argument("--sigma-int-sne", type=float, default=0.1, dest="sigma_int_sne")
-parser.add_argument("--sigma-int-qso", type=float, default=0.0, dest="sigma_int_qso")
+parser.add_argument("--sigma-int-qso", type=float, default=0.4, dest="sigma_int_qso")
 parser.add_argument("--qso-err-cut", type=float, default=0.5, dest="qso_err_cut")
 parser.add_argument("--output-dir", type=str, default="chains", dest="output_dir")
 parser.add_argument("--no-nuisance", action="store_true", help="Fix calibration offsets (M_sne, M_qso) to 0")
 parser.add_argument("--asymmetric", action="store_true", help="γCDM without δM (test if γ absorbs offset)")
+parser.add_argument("--no-quasars", action="store_true", help="Exclude Quasars from analysis")
+parser.add_argument("--fixed-anchor", action="store_true", help="Fix H0=67.4 and M=SH0ES (M=0) for ALL models")
+parser.add_argument("--sanity-check", action="store_true", help="Battle Final: ΛCDM(H0=67.4,Ωm free,M free) vs γCDM/Decay(H0=67.4,M removed)")
 args = parser.parse_args()
 
 print(f"=" * 70)
 print(f"🔮 NESTED SAMPLING: {args.model.upper()}")
+if args.no_quasars:
+    print(f"   🔭 MODE: NO QUASARS (SNe + CC only)")
 print(f"=" * 70)
 
 # ============================================================================
@@ -54,12 +59,16 @@ else:
 # Filter and extract exactly as in gammacdm_anticheat_validation.py
 sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu')]
 cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
-qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+
+if args.no_quasars:
+    qso = pd.DataFrame(columns=df.columns)
+    mu_data = sne.copy()
+else:
+    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    mu_data = pd.concat([sne, qso])
 
 n_sne = len(sne)
 n_qso = len(qso)
-
-mu_data = pd.concat([sne, qso])
 z_mu = mu_data['z'].values
 mu_obs = mu_data['val'].values
 err_mu = mu_data['err'].values
@@ -84,93 +93,130 @@ print(f"📊 Dataset: {n_sne} SNe + {n_qso} QSOs + {len(cc)} CC")
 print(f"📊 Total points N = {N}")
 
 # ============================================================================
-# SETUP LIKELIHOOD
+# SETUP LIKELIHOOD (shared module)
 # ============================================================================
-from cobaya.likelihood import Likelihood
 from cobaya.run import run
+from gammacdm_likelihoods import create_likelihoods
 
-class BaseLikelihood(Likelihood):
-    model_type = "lcdm"
-
-    def initialize(self):
-        self.z_mu = z_mu
-        self.mu_obs = mu_obs
-        self.err_eff_mu = err_eff_mu
-        self.sne_mask = sne_mask
-        self.z_cc = z_cc
-        self.H_obs = H_obs
-        self.err_cc = err_cc
-        self.norm_mu = np.sum(np.log(self.err_eff_mu**2))
-        self.norm_cc = np.sum(np.log(self.err_cc**2)) if len(self.z_cc) > 0 else 0
-
-    
-    def get_requirements(self):
-        return {"angular_diameter_distance": {"z": self.z_mu},
-                "Hubble": {"z": self.z_cc}}
-    
-    def logp(self, _derived=None, **params):
-        try:
-            DA = self.provider.get_angular_diameter_distance(self.z_mu)
-            DL = DA * (1 + self.z_mu)**2
-        except:
-            return -1e30
-        
-        mu_th = 5 * np.log10(np.maximum(DL, 1e-10)) + 25
-        
-        # Model-specific correction
-        if self.model_type == "log2":
-            gamma0 = params.get("gamma_log2", 0.0)
-            ln1pz = np.log1p(self.z_mu)
-            mu_th = mu_th + gamma0 * ln1pz**2
-        
-        # Add calibration offsets (ignored if --no-nuisance)
-        if not args.no_nuisance:
-            mu_th = mu_th + np.where(self.sne_mask, params.get('M_sne', 0), params.get('M_qso', 0))
-        
-        # -2*logL = chi2 + log(sigma^2)
-        chi2_mu = np.sum(((self.mu_obs - mu_th) / self.err_eff_mu)**2)
-        logL = -0.5 * (chi2_mu + self.norm_mu)
-        
-        if len(self.z_cc) > 0:
-            H_th = self.provider.get_Hubble(self.z_cc)
-            chi2_cc = np.sum(((self.H_obs - H_th) / self.err_cc)**2)
-            logL += -0.5 * (chi2_cc + self.norm_cc)
-        
-        return logL
-
-class LCDMLikelihood(BaseLikelihood):
-    model_type = "lcdm"
-    params = {"M_sne": None, "M_qso": None}
-
-class LOG2Likelihood(BaseLikelihood):
-    model_type = "log2"
-    params = {"gamma_log2": None, "M_sne": None, "M_qso": None}
-
-
+LCDMLikelihood, GammaCDM_LOG2_Likelihood, DecayLikelihood, LogDecayLikelihood = \
+    create_likelihoods(
+        z_mu=z_mu, mu_obs=mu_obs, err_mu=err_mu,
+        z_cc=z_cc, H_obs=H_obs, err_cc=err_cc,
+        sne_mask=sne_mask, combined_mode=True,  # nested always uses combined sne+qso
+        sigma_int_sne=SIGMA_INT_SNE, sigma_int_qso=SIGMA_INT_QSO,
+        no_nuisance=args.no_nuisance, asymmetric=args.asymmetric,
+        sanity_check=args.sanity_check
+    )
+# Alias for backward compat with model selection below
+LOG2Likelihood = GammaCDM_LOG2_Likelihood
+GammaCDM_LOG_DECAY_Likelihood = LogDecayLikelihood
+print("   ✅ Shared likelihoods loaded from gammacdm_likelihoods.py")
 
 
 # ============================================================================
 # SETUP SAMPLER
 # ============================================================================
 base_params = {
-    "H0": {"prior": {"min": 40, "max": 100}, "ref": 67, "proposal": 2.0},
+    "H0": {"prior": {"min": 40, "max": 100}, "ref": 70, "proposal": 2.0},
     "omch2": {"prior": {"min": 0.01, "max": 0.35}, "ref": 0.12, "proposal": 0.02},
-    "M_sne": {"prior": {"min": -3.0, "max": 3.0}, "ref": 0.0, "proposal": 0.1} if not (args.no_nuisance or args.asymmetric) else 0.0,
-    "M_qso": {"prior": {"min": -3.0, "max": 3.0}, "ref": 0.0, "proposal": 0.1} if not (args.no_nuisance or args.asymmetric) else 0.0,
+    "M_sne": {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05},
+    "M_qso": {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05},
     "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06
 }
+defaultH0 = {"prior": {"min": 40, "max": 100}, "ref": 70, "proposal": 2.0}
+defaultGammaLog2 = {"prior": {"min": -3.0, "max": 3.0}, "ref": -0.8, "proposal": 0.05}
+defaultA = {"prior": {"min": -3.0, "max": 3.0}, "ref": -0.175, "proposal": 0.05}
+defaultZd = {"prior": {"min": 0.01, "max": 10.0}, "ref": 3.5, "proposal": 0.1}
+# NOTE: For nested sampling, we use MLE-informed priors to prevent degeneracies.
+# MLE uses wider priors ([-3,3], ZH=1e10) to find unconstrained optimum.
+defaultA_unified = {"prior": {"min": -1.0, "max": 1.0}, "ref": -0.175, "proposal": 0.05}
+defaultZb = {"prior": {"min": 0.01, "max": 5.0}, "ref": 0.4, "proposal": 0.1}
+defaultGammaLogDecay = {"prior": {"min": -2.0, "max": 0.0}, "ref": -0.8, "proposal": 0.05}
+defaultZh = {"prior": {"min": 0.01, "max": 100.0}, "ref": 42.0, "proposal": 5.0}
+
+# Apply constraints to base_params (ΛCDM always keeps M free)
+if args.fixed_anchor:
+    print("   ⚓ FIXED ANCHOR: H0=67.4")
+    base_params["H0"] = 67.4
+    # M_sne / M_qso remain FREE (inherited from base_params) unless --no-nuisance is passed
+elif args.sanity_check:
+    print("   🧠 SANITY CHECK: H0=67.4")
+    base_params["H0"] = 67.4
+    # ΛCDM fixes omch2, keeps M free (handled in model block)
+    # γCDM/Decay keeps omch2 free, removes M (handled in model block)
+else:
+    if args.no_quasars:
+        print("   🔒 No quasars: M_qso fixed to 0")
+        base_params["M_qso"] = 0.0
+    # --no-nuisance / --asymmetric applied PER MODEL below (ΛCDM keeps M free)
+
 
 
 if args.model == "lcdm":
     LikelihoodClass = LCDMLikelihood
     params = base_params.copy()
+    # ΛCDM ALWAYS keeps M free (except --fixed-anchor)
+    if args.sanity_check:
+        print("   🧠 ΛCDM Sanity: M free, Ωm free (Fairer)")
+        # params["omch2"] = 0.12  <-- REMOVED: Let it be free to fit Quasars
     output_prefix = os.path.join(args.output_dir, "anticheat_lcdm")
-else:  # log2
+elif args.model == "log2":
     LikelihoodClass = LOG2Likelihood
     params = base_params.copy()
-    params["gamma_log2"] = {"prior": {"min": -2.0, "max": 1.0}, "ref": -1.0, "proposal": 0.05}
-    params["H0"]["ref"] = 70  # Neutral starting point
+    params["gamma_log2"] = defaultGammaLog2
+    if not args.fixed_anchor:
+        params["H0"] = defaultH0
+    # Apply --no-nuisance (fix M=0) or --asymmetric (remove M)
+    # FOR γCDM models, these flags SHOULD work even with fixed-anchor
+    if args.asymmetric or args.sanity_check:
+        print("   ✂️  Asymmetric/Sanity: M REMOVED from γCDM-LOG²")
+        params["M_sne"] = 0.0
+        params["M_qso"] = 0.0
+    elif args.no_nuisance:
+        print("   🔒 No-nuisance: M FIXED to 0 for γCDM-LOG²")
+        params["M_sne"] = 0.0
+        params["M_qso"] = 0.0
     output_prefix = os.path.join(args.output_dir, "anticheat_log2")
+elif args.model == "decay":
+    LikelihoodClass = DecayLikelihood
+    params = base_params.copy()
+    # Decay H0 freedom should match other models for fair comparison
+    if not args.fixed_anchor and not args.sanity_check:
+        params["H0"] = defaultH0
+    params["A"] = defaultA
+    params["zd"] = defaultZd
+    # Apply --no-nuisance (fix M=0) or --asymmetric (remove M)
+    if args.asymmetric or args.sanity_check:
+        print("   ✂️  Asymmetric/Sanity: M REMOVED from Decay model")
+        params["M_sne"] = 0.0
+        params["M_qso"] = 0.0
+    elif args.no_nuisance:
+        print("   🔒 No-nuisance: M FIXED to 0 for Decay model")
+        params["M_sne"] = 0.0
+        params["M_qso"] = 0.0
+    output_prefix = os.path.join(args.output_dir, "anticheat_decay")
+elif args.model == "log_decay":
+    LikelihoodClass = LogDecayLikelihood
+    params = base_params.copy()
+    params["A"] = defaultA_unified
+    params["zb"] = defaultZb
+    params["gamma_log_decay"] = defaultGammaLogDecay
+    params["zh"] = defaultZh
+    # Tighten δM priors for LOG²-Decay to break A↔δM degeneracy
+    if isinstance(params.get("M_sne"), dict):
+        params["M_sne"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
+        params["M_qso"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
+    if not args.fixed_anchor and not args.sanity_check:
+        params["H0"] = defaultH0
+    if args.asymmetric or args.sanity_check:
+        print("   ✂️  Asymmetric/Sanity: M REMOVED from γCDM-LOG²-DECAY")
+        params["M_sne"] = 0.0
+        params["M_qso"] = 0.0
+    elif args.no_nuisance:
+        print("   🔒 No-nuisance: M FIXED to 0 for γCDM-LOG²-DECAY")
+        params["M_sne"] = 0.0
+        params["M_qso"] = 0.0
+    output_prefix = os.path.join(args.output_dir, "anticheat_log_decay")
 
 sampler_cfg = {
     "polychord": {
@@ -204,8 +250,19 @@ logZ = sampler.products().get("logZ", None)
 if logZ is None:
     logZ = getattr(sampler, 'logZ', None)
 
-H0_mean = float(np.mean(samples["H0"]))
-H0_std = float(np.std(samples["H0"]))
+if args.model == "decay" or args.fixed_anchor or args.sanity_check:
+    # H0 is fixed
+    H0_mean = 67.4
+    H0_std = 0.0
+else:
+    if "H0" in samples:
+        H0_mean = float(np.mean(samples["H0"]))
+        H0_std = float(np.std(samples["H0"]))
+    else:
+        # Fallback if somehow missing but not strictly fixed by logic above
+        H0_mean = 67.4
+        H0_std = 0.0
+
 M_sne_mean = float(np.mean(samples["M_sne"])) if "M_sne" in samples else 0.0
 M_qso_mean = float(np.mean(samples["M_qso"])) if "M_qso" in samples else 0.0
 
@@ -218,13 +275,27 @@ results = {
     "omch2_std": float(np.std(samples["omch2"])),
     "M_sne_mean": M_sne_mean,
     "M_qso_mean": M_qso_mean,
-    "deltaM_mean": (M_sne_mean + M_qso_mean) / 2
+    "deltaM_mean": (M_sne_mean + M_qso_mean) / 2,
+    "ombh2": 0.0224  # Fixed parameter
 }
 
 if args.model == "log2":
     results["gamma_log2_mean"] = float(np.mean(samples["gamma_log2"]))
     results["gamma_log2_std"] = float(np.std(samples["gamma_log2"]))
-
+elif args.model == "decay":
+    results["A_mean"] = float(np.mean(samples["A"]))
+    results["A_std"] = float(np.std(samples["A"]))
+    results["zd_mean"] = float(np.mean(samples["zd"]))
+    results["zd_std"] = float(np.std(samples["zd"]))
+elif args.model == "log_decay":
+    results["A_mean"] = float(np.mean(samples["A"]))
+    results["A_std"] = float(np.std(samples["A"]))
+    results["zb_mean"] = float(np.mean(samples["zb"]))
+    results["zb_std"] = float(np.std(samples["zb"]))
+    results["gamma_log_decay_mean"] = float(np.mean(samples["gamma_log_decay"]))
+    results["gamma_log_decay_std"] = float(np.std(samples["gamma_log_decay"]))
+    results["zh_mean"] = float(np.mean(samples["zh"]))
+    results["zh_std"] = float(np.std(samples["zh"]))
 
 
 # Save results
@@ -236,11 +307,69 @@ with open(results_file, "w") as f:
 print(f"\n" + "=" * 70)
 print(f"📋 NESTED — {args.model.upper()}")
 print(f"=" * 70)
-print(f"   H₀    = {H0_mean:.2f} ± {H0_std:.2f} km/s/Mpc")
+
+# 1. Hubble Constant
+print(f"   H₀    = {H0_mean:.2f} ± {H0_std:.2f} km/s/Mpc {'(Fixed)' if H0_std==0 else ''}")
+
+# 2. Baryonic Matter (omch2)
+om_val = float(np.mean(samples["omch2"]))
+om_err = float(np.std(samples["omch2"]))
+print(f"   Ωch²  = {om_val:.4f} ± {om_err:.4f}")
+print(f"   Ωmh²  = {om_val + 0.0224:.4f} (Baryon check, Ωbh²=0.0224)")
+
+# 3. Model Specific Parameters
 if args.model == "log2":
-    print(f"   γ₀    = {results['gamma_log2_mean']:.4f} ± {results['gamma_log2_std']:.4f}")
-print(f"   M_sne = {M_sne_mean:.3f}, M_qso = {M_qso_mean:.3f}")
-print(f"   ⟨δM⟩  = {results['deltaM_mean']:.3f}")
+    g_val = results['gamma_log2_mean']
+    g_err = results['gamma_log2_std']
+    print(f"   γ₀    = {g_val:.4f} ± {g_err:.4f}")
+    # Spin implication
+    beta = abs(g_val) * np.log(10) / 5
+    alpha = beta / 2
+    spin = np.sqrt(1 - ((1 - alpha) / (1 + alpha))**2) if alpha < 1 else 1.0
+    print(f"   🌀 Spin Implied: a/M = {spin:.4f}")
+elif args.model == "decay":
+    a_val = results['A_mean']
+    a_err = results['A_std']
+    zd_val = results['zd_mean']
+    zd_err = results['zd_std']
+    print(f"   A     = {a_val:.3f} ± {a_err:.3f}")
+    print(f"   zd    = {zd_val:.3f} ± {zd_err:.3f}")
+    # Local H0
+    h0_loc = H0_mean * 10**(-a_val/5)
+    print(f"   → H₀(local) implied: {h0_loc:.2f} km/s/Mpc")
+elif args.model == "log_decay":
+    a_val = results['A_mean']
+    a_err = results['A_std']
+    zb_val = results['zb_mean']
+    zb_err = results['zb_std']
+    g_val = results['gamma_log_decay_mean']
+    g_err = results['gamma_log_decay_std']
+    zh_val = results['zh_mean']
+    zh_err = results['zh_std']
+    print(f"   A     = {a_val:.4f} ± {a_err:.4f} (Bubble amplitude)")
+    print(f"   z_b   = {zb_val:.3f} ± {zb_err:.3f} (Bubble decay scale)")
+    print(f"   γ₀    = {g_val:.4f} ± {g_err:.4f} (Kerr geometry)")
+    print(f"   z_h   = {zh_val:.3f} ± {zh_err:.3f} (Horizon decay scale)")
+    # Spin from Kerr component
+    beta = abs(g_val) * np.log(10) / 5
+    alpha = beta / 2
+    spin = np.sqrt(1 - ((1 - alpha) / (1 + alpha))**2) if alpha < 1 else 1.0
+    print(f"   🌀 Spin Implied: a/M = {spin:.4f}")
+    # Local H0 from bubble component
+    h0_loc = H0_mean * 10**(-a_val/5)
+    print(f"   → H₀(local) implied: {h0_loc:.2f} km/s/Mpc (Bubble A={a_val:.3f})")
+
+# 4. Nuisance Parameters (M)
+is_fixed_m = args.sanity_check or args.no_nuisance or (args.asymmetric and args.model != "lcdm")
+if is_fixed_m:
+    print(f"   M_sne = 0.000 (Fixed), M_qso = 0.000 (Fixed)")
+    print(f"   ⟨δM⟩  = 0.000 (Fixed)")
+else:
+    print(f"   M_sne = {M_sne_mean:.3f}, M_qso = {M_qso_mean:.3f}")
+    print(f"   ⟨δM⟩  = {results['deltaM_mean']:.3f}")
+
 if logZ:
     print(f"   log(Z) = {logZ:.2f}")
+
 print(f"\n✅ Results saved to: {results_file}")
+
