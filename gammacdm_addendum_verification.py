@@ -191,7 +191,7 @@ def report_model_summary(model_name, samples, args, logZ=None, title_prefix="�
 
     # 4. Nuisance Parameters (M)
     is_lcdm = model_name.lower().replace("λ", "l") == "lcdm" or model_name.lower() == "lcdm"
-    is_fixed_m = args.sanity_check or args.no_nuisance or (args.asymmetric and not is_lcdm)
+    is_fixed_m = (args.sanity_check or args.no_nuisance or args.asymmetric) and not is_lcdm
     
     if is_fixed_m:
         print(f"   M_sne = 0.000 (Fixed), M_qso = 0.000 (Fixed)")
@@ -222,8 +222,14 @@ parser.add_argument("--no-quasars", action="store_true", dest="no_quasars",
                     help="Exclude quasars (SNe + CC only)")
 parser.add_argument("--quasars-only", "--quasars", action="store_true", dest="quasars_only",
                     help="Use quasars only (high-z test)")
-parser.add_argument("--qso-err-cut", type=float, default=0.5, dest="qso_err_cut",
-                    help="Max quasar error to include (default: 0.5 mag)")
+parser.add_argument("--qso-err-cut", type=float, default=1.5, dest="qso_err_cut",
+                    help="Max quasar error to include (default: 1.5 mag)")
+parser.add_argument("--sne-err-cut", type=float, default=0.5, dest="sne_err_cut",
+                    help="Max supernova error to include (default: 0.5 mag)")
+parser.add_argument("--z-min", type=float, default=0.01, dest="z_min",
+                    help="Minimum redshift to include (default: 0.01, removes local peculiar velocities)")
+parser.add_argument("--revised", action="store_true",
+                    help="Use full_dataset_revisado.csv instead of full_dataset.csv")
 parser.add_argument("--asymmetric", action="store_true",
                     help="γCDM without δM (test if γ absorbs offset)")
 parser.add_argument("--mock", action="store_true",
@@ -241,7 +247,7 @@ parser.add_argument("--nlive", type=int, default=200,
 parser.add_argument("--no-nuisance", action="store_true", help="Fix calibration offsets (M_sne, M_qso) to 0")
 parser.add_argument("--fixed-anchor", action="store_true", help="Fix H0=67.4 and M=SH0ES (M=0) for ALL models")
 parser.add_argument("--sanity-check", action="store_true", dest="sanity_check",
-                    help="Battle Final: ΛCDM(H0=67.4,Ωm=0.315,M free) vs γCDM/Decay(H0=67.4,M removed)")
+                    help="Internal sanity check: ΛCDM(H0=67.4,Ωm=0.315,M free) vs γCDM/Decay(H0=67.4,M removed)")
 parser.add_argument("--output-dir", type=str, default="chains", help="Output directory for nested sampling chains")
 parser.add_argument("--legacy", action="store_true", help="Include legacy models (γCDM-LINEAL, γCDM-LOG³) in MLE analysis")
 args = parser.parse_args()
@@ -257,21 +263,22 @@ print(f"   ⚙️  Intrinsic scatter: σ_int,SNe = {args.sigma_int_sne:.2f}, σ_
 print(f"   ⚙️  Physical prior: Ωm < 1 enforced (flat ΛCDM with ΩΛ ≥ 0)")
 
 # Try local first, then GitHub
+dataset_name = 'full_dataset_revisado.csv' if args.revised else 'full_dataset.csv'
 try:
-    df = pd.read_csv('full_dataset.csv')
+    df = pd.read_csv(dataset_name)
 except Exception:
     try:
-        df = pd.read_csv('../full_dataset.csv')
+        df = pd.read_csv('../' + dataset_name)
     except Exception:
-        df = pd.read_csv('https://raw.githubusercontent.com/indigenica/akashic-alpha-engine/main/full_dataset.csv')
+        df = pd.read_csv('https://raw.githubusercontent.com/indigenica/akashic-alpha-engine/main/' + dataset_name)
 
 if args.quasars_only:
     # ── QUASARS ONLY (high-z test) ──
     print(f"\n🔭 MODE: Quasars only (high-z test, err < {args.qso_err_cut})")
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min)]
 
     print(f"\n📊 Dataset:")
-    print(f"   Quasars: {len(qso)} pts (μ observable)")
+    print(f"   Quasars: {len(qso)} pts (μ observable, err < {args.qso_err_cut})")
     print(f"   z range: {qso['z'].min():.2f} – {qso['z'].max():.2f}")
     print(f"   ⟨σ⟩ = {qso['err'].mean():.2f} mag")
 
@@ -285,15 +292,16 @@ if args.quasars_only:
 
     N = len(qso)
     COMBINED_MODE = False
+    SIGMA_INT_SINGLE = args.sigma_int_qso
 
 elif args.no_quasars:
     # ── SNe Ia + CC (sin quasars) ──
-    print("\n🔭 MODE: SNe Ia + CC (sin quasars)")
-    sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu')]
+    print(f"\n🔭 MODE: SNe Ia (err < {args.sne_err_cut}, z > {args.z_min}) + CC (sin quasars)")
+    sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min)]
     cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
 
     print(f"\n📊 Dataset:")
-    print(f"   SNe Ia: {len(sne)} pts (μ)")
+    print(f"   SNe Ia: {len(sne)} pts (μ, err < {args.sne_err_cut}, z > {args.z_min})")
     print(f"   CC:     {len(cc)} pts (H)")
     print(f"   Total:  {len(sne) + len(cc)} pts")
 
@@ -307,10 +315,11 @@ elif args.no_quasars:
 
     N = len(sne) + len(cc)
     COMBINED_MODE = False
+    SIGMA_INT_SINGLE = args.sigma_int_sne
 
 else:
-    # ── DEFAULT: SNe Ia + Quasars (err < cut) + CC ──
-    sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu')]
+    # ── DEFAULT: SNe Ia (err < cut) + Quasars (err < cut) + CC ──
+    sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min)]
     cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
     qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
 
@@ -323,9 +332,9 @@ else:
     sne_mask[:n_sne] = True
     qso_mask = ~sne_mask
 
-    print(f"\n🔭 MODE: SNe Ia + Quasars (err < {args.qso_err_cut}) + CC")
+    print(f"\n🔭 MODE: SNe Ia (err < {args.sne_err_cut}, z > {args.z_min}) + Quasars (err < {args.qso_err_cut}) + CC")
     print(f"\n📊 Dataset:")
-    print(f"   SNe Ia:   {n_sne} pts (μ)")
+    print(f"   SNe Ia:   {n_sne} pts (μ, err < {args.sne_err_cut}, z > {args.z_min})")
     print(f"   Quasars:  {n_qso} pts (μ, err < {args.qso_err_cut})")
     print(f"   CC:       {len(cc)} pts (H)")
     print(f"   Total μ:  {len(mu_data)} pts")
@@ -454,7 +463,7 @@ def chi2_lcdm(params):
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
             mu_th = mu_th_base + delta_M
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
         # -2·logL = χ² + normalization term (for proper comparison with varying σ_int)
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
@@ -553,7 +562,7 @@ def chi2_gcdm(params):
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
             mu_th = mu_th_base + delta_M + gamma_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -590,7 +599,7 @@ def chi2_lcdm_no_M(params):
             sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
         if len(z_cc) > 0:
@@ -636,7 +645,7 @@ def chi2_gcdm_no_M(params):
             sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -710,7 +719,7 @@ def chi2_gcdm_linear(params):
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
             mu_th = mu_th_base + delta_M + gamma_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -780,7 +789,7 @@ def chi2_gcdm_log_squared(params):
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
             mu_th = mu_th_base + delta_M + gamma_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -850,7 +859,7 @@ def chi2_gcdm_log_cubed(params):
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
             mu_th = mu_th_base + delta_M + gamma_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -896,7 +905,7 @@ def chi2_gcdm_linear_no_M(params):
             sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -939,7 +948,7 @@ def chi2_gcdm_log_squared_no_M(params):
             sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -981,7 +990,7 @@ def chi2_gcdm_log_cubed_no_M(params):
             sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -1130,7 +1139,7 @@ def chi2_decay_no_M(params):
             sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -1286,7 +1295,7 @@ def chi2_gcdm_log_decay_no_M(params):
             sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
         chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
         norm_term = np.sum(np.log(err_eff**2))
@@ -1849,7 +1858,7 @@ if spin_gamma is not None and spin_gamma != 0:
     print(f"   Container Spin ({spin_model_name}):  a/M ≈ {spin:.2f}")
 
     print(f"\n   🔬 INTERPRETACIÓN HIPOTÉTICA:")
-    print(f"   Mayor spin → mayor frame-dragging → lensing cuadrático con decay → container finito")
+    print(f"   Mayor spin → mayor frame-dragging → lensing cuadrático con decay → container rotante finito")
     if spin > 0.6:
         print(f"   Consistente con spins observados en BH supermasivos (0.7–0.9)")
 
@@ -2078,6 +2087,8 @@ if args.mcmc or args.nested:
                 "--sigma-int-sne", str(args.sigma_int_sne),
                 "--sigma-int-qso", str(args.sigma_int_qso),
                 "--qso-err-cut", str(args.qso_err_cut),
+                "--sne-err-cut", str(args.sne_err_cut),
+                "--z-min", str(args.z_min),
                 "--output-dir", args.output_dir
             ]
             
@@ -2090,6 +2101,18 @@ if args.mcmc or args.nested:
             if args.sanity_check:
                 common_args.append("--sanity-check")
 
+            
+            if args.quasars_only:
+                common_args.append("--quasars-only")
+
+            if args.revised:
+                common_args.append("--revised")
+
+            if args.asymmetric:
+                common_args.append("--asymmetric")
+
+            if args.no_nuisance:
+                common_args.append("--no-nuisance")
             
             # ==================================================================
             # PARALLEL EXECUTION (Robust)
@@ -2109,15 +2132,16 @@ if args.mcmc or args.nested:
             # --- Launch Processes ---
             
             # 1. ΛCDM (never gets --asymmetric or --no-nuisance: ΛCDM always keeps M free)
+            lcdm_args = [arg for arg in common_args if arg not in ("--asymmetric", "--no-nuisance")]
+
             proc_lcdm = subprocess.Popen(
-                [python_exe, script_path, "lcdm"] + common_args,
+                [python_exe, script_path, "lcdm"] + lcdm_args,
                 stdout=f_lcdm, stderr=subprocess.STDOUT, text=True
             )
             
             # 2. γCDM-LOG² (legacy only)
-            model_args = common_args + (["--asymmetric"] if args.asymmetric else [])
-            if args.no_nuisance and "--no-nuisance" not in model_args:
-                model_args.append("--no-nuisance")
+            # The base model arguments are inherited from common_args now.
+            model_args = common_args.copy()
 
             proc_log2 = None
             if args.legacy:
@@ -2196,20 +2220,20 @@ if args.mcmc or args.nested:
             
             # Load results
             try:
-                with open(os.path.join(args.output_dir, "anticheat_lcdm_results.json"), "r") as f:
+                with open(os.path.join(args.output_dir, "nested_lcdm_results.json"), "r") as f:
                     res_lcdm = json.load(f)
                 try:
-                    with open(os.path.join(args.output_dir, "anticheat_log2_results.json"), "r") as f:
+                    with open(os.path.join(args.output_dir, "nested_log2_results.json"), "r") as f:
                         res_log2 = json.load(f)
                 except FileNotFoundError:
                     res_log2 = None
                 try:
-                    with open(os.path.join(args.output_dir, "anticheat_decay_results.json"), "r") as f:
+                    with open(os.path.join(args.output_dir, "nested_decay_results.json"), "r") as f:
                         res_decay = json.load(f)
                 except FileNotFoundError:
                     res_decay = None
                 try:
-                    with open(os.path.join(args.output_dir, "anticheat_log_decay_results.json"), "r") as f:
+                    with open(os.path.join(args.output_dir, "nested_log_decay_results.json"), "r") as f:
                         res_log_decay = json.load(f)
                 except FileNotFoundError:
                     res_log_decay = None
@@ -2340,26 +2364,27 @@ if args.mcmc or args.nested:
                 from getdist import loadMCSamples
                 print(f"\n⏳ Loading chains for plots...")
                 try:
+                    prefix = "nested" if args.nested else "mcmc"
                     # Load LCDM
-                    gd_lcdm = loadMCSamples(os.path.join(args.output_dir, "anticheat_lcdm"), settings={'ignore_rows': 0.2})
+                    gd_lcdm = loadMCSamples(os.path.join(args.output_dir, f"{prefix}_lcdm"), settings={'ignore_rows': 0.2})
                     samples_lcdm = {p: gd_lcdm.samples[:, i] for i, p in enumerate(gd_lcdm.getParamNames().list())}
                     # Load LOG2 (legacy only)
                     if res_log2:
-                        gd_log2 = loadMCSamples(os.path.join(args.output_dir, "anticheat_log2"), settings={'ignore_rows': 0.2})
+                        gd_log2 = loadMCSamples(os.path.join(args.output_dir, f"{prefix}_log2"), settings={'ignore_rows': 0.2})
                         samples_log2 = {p: gd_log2.samples[:, i] for i, p in enumerate(gd_log2.getParamNames().list())}
                     else:
                         samples_log2 = None
                     
                     # Load Decay
                     if res_decay:
-                        gd_decay = loadMCSamples(os.path.join(args.output_dir, "anticheat_decay"), settings={'ignore_rows': 0.2})
+                        gd_decay = loadMCSamples(os.path.join(args.output_dir, f"{prefix}_decay"), settings={'ignore_rows': 0.2})
                         samples_decay = {p: gd_decay.samples[:, i] for i, p in enumerate(gd_decay.getParamNames().list())}
                     else:
                         samples_decay = None
 
                     # Load LOG²-DECAY
                     if res_log_decay:
-                        gd_log_decay = loadMCSamples(os.path.join(args.output_dir, "anticheat_log_decay"), settings={'ignore_rows': 0.2})
+                        gd_log_decay = loadMCSamples(os.path.join(args.output_dir, f"{prefix}_log_decay"), settings={'ignore_rows': 0.2})
                         samples_log_decay = {p: gd_log_decay.samples[:, i] for i, p in enumerate(gd_log_decay.getParamNames().list())}
                     else:
                         samples_log_decay = None
@@ -2375,42 +2400,19 @@ if args.mcmc or args.nested:
             
             # Continue to allow the rest of the script (plots, etc) to run
             print("\n   ✅ Parallel nested sampling results aggregated!")
-            
-            # Detailed Nested Report for models
-            if args.nested:
-                # 1. ΛCDM
-                report_model_summary("ΛCDM", res_lcdm if 'samples_lcdm' not in locals() or samples_lcdm is None else samples_lcdm, args, logZ=logZ_lcdm, title_prefix="📋 NESTED —")
-
-                # 2. γCDM-LOG² (legacy only)
-                if res_log2:
-                    report_model_summary("γCDM-LOG²", res_log2 if 'samples_log2' not in locals() or samples_log2 is None else samples_log2, args, logZ=logZ_log2, title_prefix="📋 NESTED —")
-
-                # 3. γCDM-Decay
-                if res_decay:
-                    decay_s = samples_decay if 'samples_decay' in locals() and samples_decay is not None else res_decay
-                    report_model_summary("γCDM-Decay", decay_s, args, logZ=logZ_decay, title_prefix="📋 NESTED —")
-
-                # 4. γCDM-LOG²-DECAY
-                if 'res_log_decay' in locals() and res_log_decay:
-                    ld_s = samples_log_decay if 'samples_log_decay' in locals() and samples_log_decay is not None else res_log_decay
-                    report_model_summary("γCDM-LOG²-Decay", ld_s, args, logZ=logZ_log_decay, title_prefix="📋 NESTED —")
-
-
-            
-
-
         # ========================================================================
-        # RESULTS INITIALIZATION
+        # RESULTS INITIALIZATION (only overwrite if not nested)
         # ========================================================================
-        logZ_lcdm = None
-        logZ_log2 = None
-        logZ_decay = None
-        logZ_log_decay = None
-        samples_lcdm = None
-        samples_log2 = None
-        samples_decay = None
-        samples_log_decay = None
-        has_log2_samples = False
+        if not args.nested:
+            logZ_lcdm = None
+            logZ_log2 = None
+            logZ_decay = None
+            logZ_log_decay = None
+            samples_lcdm = None
+            samples_log2 = None
+            samples_decay = None
+            samples_log_decay = None
+            has_log2_samples = False
 
         # ========================================================================
         # MCMC FLOW (only when NOT using --nested subprocess mode)
@@ -2476,42 +2478,20 @@ if args.mcmc or args.nested:
                 pass
             
             info_l = {"likelihood": {"lcdm": LCDMLikelihood}, "theory": {"camb": {"stop_at_error": True}},
-                      "params": lcdm_p, "sampler": sampler_cfg, "output": os.path.join(args.output_dir, "anticheat_lcdm"), "force": True}
+                      "params": lcdm_p, "sampler": sampler_cfg, "output": os.path.join(args.output_dir, "mcmc_lcdm"), "force": True}
             _, sampler_lcdm = run(info_l)
             
             # Force load from file for MCMC to ensure full chain access
             try:
-                samples_lcdm = loadMCSamples(os.path.join(args.output_dir, "anticheat_lcdm"), settings={'ignore_rows':0.3})
+                samples_lcdm = loadMCSamples(os.path.join(args.output_dir, "mcmc_lcdm"), settings={'ignore_rows':0.3})
                 print(f"   ✅ Loaded ΛCDM samples from file: {samples_lcdm.numrows} samples")
             except Exception as e:
                 print(f"   ⚠️ Could not load ΛCDM samples from file, using in-memory: {e}")
                 samples_lcdm = sampler_lcdm.products().get("sample")
             
-        # Extract log-evidence if using nested sampling
-        if args.nested:
-            try:
-                logZ_lcdm = sampler_lcdm.products().get("logZ", None)
-                if logZ_lcdm is None:
-                    # Try alternative access method
-                    logZ_lcdm = getattr(sampler_lcdm, 'logZ', None)
-            except:
-                pass
-
-            # Report ΛCDM (MCMC or Nested)
+        # Report ΛCDM MCMC if not nested
+        if not args.nested:
             report_model_summary("ΛCDM", samples_lcdm, args, logZ=logZ_lcdm, title_prefix=f"📋 {sampler_name.upper()} —")
-
-
-        # Reset MPI if using nested sampling (PolyChord calls MPI_FINALIZE)
-        if args.nested:
-            try:
-                # Force reimport of pypolychord to reset MPI state
-                import sys
-                mods_to_remove = [m for m in sys.modules if 'polychord' in m.lower() or 'mpi' in m.lower()]
-                for m in mods_to_remove:
-                    del sys.modules[m]
-                print("   🔄 MPI state reset attempted")
-            except Exception as e:
-                print(f"   ⚠️ MPI reset failed: {e}")
 
         # ── γCDM-LOG² MCMC (legacy only, not in nested subprocess mode) ──
         if not args.nested and args.legacy:
@@ -2529,12 +2509,12 @@ if args.mcmc or args.nested:
             if not args.fixed_anchor and not args.sanity_check:
                 log2_p["H0"]["ref"] = 73
             info_log2 = {"likelihood": {"log2": GammaCDM_LOG2_Likelihood}, "theory": {"camb": {"stop_at_error": True}},
-                            "params": log2_p, "sampler": sampler_cfg, "output": os.path.join(args.output_dir, "anticheat_log2"), "force": True}
+                            "params": log2_p, "sampler": sampler_cfg, "output": os.path.join(args.output_dir, "mcmc_log2"), "force": True}
             _, sampler_log2 = run(info_log2)
             
             # Force load from file
             try:
-                samples_log2 = loadMCSamples(os.path.join(args.output_dir, "anticheat_log2"), settings={'ignore_rows':0.3})
+                samples_log2 = loadMCSamples(os.path.join(args.output_dir, "mcmc_log2"), settings={'ignore_rows':0.3})
                 print(f"   ✅ Loaded γCDM-LOG² samples from file: {samples_log2.numrows} samples")
             except Exception as e:
                 print(f"   ⚠️ Could not load γCDM-LOG² samples from file, using in-memory: {e}")
@@ -2559,25 +2539,18 @@ if args.mcmc or args.nested:
             # If sanity check, H0=67.4 is already in base_params
             
             info_decay = {"likelihood": {"decay": DecayLikelihood}, "theory": {"camb": {"stop_at_error": True}},
-                             "params": decay_p, "sampler": sampler_cfg, "output": os.path.join(args.output_dir, "anticheat_decay"), "force": True}
+                             "params": decay_p, "sampler": sampler_cfg, "output": os.path.join(args.output_dir, "mcmc_decay"), "force": True}
             _, sampler_decay = run(info_decay)
             
             # Force load from file
             try:
-                samples_decay = loadMCSamples(os.path.join(args.output_dir, "anticheat_decay"), settings={'ignore_rows':0.3})
+                samples_decay = loadMCSamples(os.path.join(args.output_dir, "mcmc_decay"), settings={'ignore_rows':0.3})
                 print(f"   ✅ Loaded γCDM-Decay samples from file: {samples_decay.numrows} samples")
             except Exception as e:
                 print(f"   ⚠️ Could not load γCDM-Decay samples from file, using in-memory: {e}")
                 samples_decay = sampler_decay.products().get("sample")
             
-            # Extract log-evidence if using nested sampling
-            if args.nested:
-                try:
-                    logZ_decay = sampler_decay.products().get("logZ", None)
-                    if logZ_decay is None:
-                        logZ_decay = getattr(sampler_decay, 'logZ', None)
-                except:
-                    pass
+
 
         # ── γCDM-LOG²-DECAY MCMC (only when NOT using --nested subprocess mode) ──
         if not args.nested:
@@ -2610,25 +2583,18 @@ if args.mcmc or args.nested:
             # If sanity check, H0=67.4 is already in base_params
             
             info_log_decay = {"likelihood": {"log_decay": GammaCDM_LOG_DECAY_Likelihood}, "theory": {"camb": {"stop_at_error": True}},
-                             "params": log_decay_p, "sampler": sampler_cfg, "output": os.path.join(args.output_dir, "anticheat_log_decay"), "force": True}
+                             "params": log_decay_p, "sampler": sampler_cfg, "output": os.path.join(args.output_dir, "mcmc_log_decay"), "force": True}
             _, sampler_log_decay = run(info_log_decay)
             
             # Force load from file
             try:
-                samples_log_decay = loadMCSamples(os.path.join(args.output_dir, "anticheat_log_decay"), settings={'ignore_rows':0.3})
+                samples_log_decay = loadMCSamples(os.path.join(args.output_dir, "mcmc_log_decay"), settings={'ignore_rows':0.3})
                 print(f"   ✅ Loaded γCDM-LOG²-DECAY samples from file: {samples_log_decay.numrows} samples")
             except Exception as e:
                 print(f"   ⚠️ Could not load γCDM-LOG²-Decay samples from file, using in-memory: {e}")
                 samples_log_decay = sampler_log_decay.products().get("sample")
             
-            # Extract log-evidence if using nested sampling
-            if args.nested:
-                try:
-                    logZ_log_decay = sampler_log_decay.products().get("logZ", None)
-                    if logZ_log_decay is None:
-                        logZ_log_decay = getattr(sampler_log_decay, 'logZ', None)
-                except:
-                    pass
+
 
         # ── Report Results ──
         if samples_lcdm is not None:
@@ -2641,7 +2607,7 @@ if args.mcmc or args.nested:
         if samples_decay is not None:
             report_model_summary("γCDM-Decay", samples_decay, args, logZ=logZ_decay, title_prefix=f"📋 {sampler_name.upper()} —")
 
-        if 'samples_log_decay' in locals() and samples_log_decay is not None:
+        if samples_log_decay is not None:
             report_model_summary("γCDM-LOG²-Decay", samples_log_decay, args, logZ=logZ_log_decay, title_prefix=f"📋 {sampler_name.upper()} —")
         
         # ── Bayes Factor Summary (nested sampling only) ──
@@ -2677,6 +2643,7 @@ if args.mcmc or args.nested:
         # ========================================================================
         print(f"\n🎨 Generando gráficos de alta fidelidad...")
         try:
+            prefix = "nested" if getattr(args, "nested", False) else "mcmc"
             from scipy.stats import gaussian_kde
             import matplotlib.patches as mpatches
 
@@ -2734,13 +2701,13 @@ if args.mcmc or args.nested:
             # Aesthetics
             ax.set_xlabel(r'$H_0$ [km/s/Mpc]', fontsize=14, fontweight='bold')
             ax.set_ylabel('Probability Density', fontsize=14, fontweight='bold')
-            ax.set_title(r'Hubble Tension Resolution: $\Lambda$CDM vs Modified Gravity', fontsize=16, pad=20)
+            ax.set_title(r'Hubble Tension: $\Lambda$CDM vs $\gamma$CDM', fontsize=16, pad=20)
             ax.grid(alpha=0.2, ls='--')
             ax.legend(loc='upper right', frameon=True, framealpha=0.9, fontsize=10)
             ax.set_xlim(58, 80)
             
             plt.tight_layout()
-            h0_plot_path = os.path.join(args.output_dir, "H0_perfect_comparison.png")
+            h0_plot_path = os.path.join(args.output_dir, f"{prefix}_H0_comparison.png")
             plt.savefig(h0_plot_path, dpi=200, bbox_inches='tight')
             print(f"   ✅ {h0_plot_path}")
 
@@ -2810,6 +2777,18 @@ if args.mcmc or args.nested:
                     viz_data.append(zd_vals)
                     viz_names.append("zd")
                     viz_labels.append(r"z_d")
+                    
+                zb_vals = _safe_get(s, 'zb')
+                if zb_vals is not None:
+                    viz_data.append(zb_vals)
+                    viz_names.append("zb")
+                    viz_labels.append(r"z_b")
+                    
+                zh_vals = _safe_get(s, 'zh')
+                if zh_vals is not None:
+                    viz_data.append(zh_vals)
+                    viz_names.append("zh")
+                    viz_labels.append(r"z_h")
 
                 if viz_data:
                     mcs = MCSamples(samples=np.column_stack(viz_data), 
@@ -2829,7 +2808,7 @@ if args.mcmc or args.nested:
                     header += r" ($H_0$ Fixed @ 67.4)"
                 plt.suptitle(header, fontsize=18, y=1.03)
                 
-                corner_plot_path = os.path.join(args.output_dir, "unified_comparison_corner.png")
+                corner_plot_path = os.path.join(args.output_dir, f"{prefix}_unified_comparison_corner.png")
                 g.export(corner_plot_path)
                 print(f"   ✅ {corner_plot_path}")
 
@@ -2868,8 +2847,8 @@ if args.mcmc or args.nested:
                                                    names=full_names, labels=full_labels, label="γCDM-LOG²"),
                                         filled=True, color_line='#e11d48')
                     plt.suptitle(r"$\gamma$CDM-LOG²: Full Parameter Space Topology", fontsize=16, y=1.02)
-                    plt.savefig(os.path.join(args.output_dir, "log2_full_corner.png"), dpi=150, bbox_inches='tight')
-                    print("   ✅ chains/log2_full_corner.png")
+                    plt.savefig(os.path.join(args.output_dir, f"{prefix}_log2_full_corner.png"), dpi=150, bbox_inches='tight')
+                    print(f"   ✅ chains/{prefix}_log2_full_corner.png")
 
             # --- D. INDIVIDUAL LOG-DECAY PARAMETER SPACE (Full detail) ---
             if "log_decay" in plot_models:
@@ -2907,8 +2886,8 @@ if args.mcmc or args.nested:
                                                    names=full_names, labels=full_labels, label="γCDM-LOG²-Decay"),
                                         filled=True, color_line='#eab308')
                     plt.suptitle(r"$\gamma$CDM-LOG²-Decay: Full Parameter Space Topology", fontsize=16, y=1.02)
-                    plt.savefig(os.path.join(args.output_dir, "log_decay_full_corner.png"), dpi=150, bbox_inches='tight')
-                    print("   ✅ chains/log_decay_full_corner.png")
+                    plt.savefig(os.path.join(args.output_dir, f"{prefix}_log_decay_full_corner.png"), dpi=150, bbox_inches='tight')
+                    print(f"   ✅ chains/{prefix}_log_decay_full_corner.png")
 
             # --- E. INDIVIDUAL DECAY PARAMETER SPACE (Full detail) ---
             if "decay" in plot_models:
@@ -2944,8 +2923,8 @@ if args.mcmc or args.nested:
                                                    names=full_names, labels=full_labels, label="γCDM-Decay"),
                                         filled=True, color_line='#2563eb')
                     plt.suptitle(r"$\gamma$CDM-Decay: Full Parameter Space Topology", fontsize=16, y=1.02)
-                    plt.savefig(os.path.join(args.output_dir, "decay_full_corner.png"), dpi=150, bbox_inches='tight')
-                    print("   ✅ chains/decay_full_corner.png")
+                    plt.savefig(os.path.join(args.output_dir, f"{prefix}_decay_full_corner.png"), dpi=150, bbox_inches='tight')
+                    print(f"   ✅ chains/{prefix}_decay_full_corner.png")
 
         except Exception as e:
             print(f"   ⚠️ Error crítico en generación de gráficos: {e}")

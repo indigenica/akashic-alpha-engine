@@ -21,19 +21,25 @@ parser.add_argument("model", choices=["lcdm", "log2", "decay", "log_decay"])
 parser.add_argument("--nlive", type=int, default=100)
 parser.add_argument("--sigma-int-sne", type=float, default=0.1, dest="sigma_int_sne")
 parser.add_argument("--sigma-int-qso", type=float, default=0.4, dest="sigma_int_qso")
-parser.add_argument("--qso-err-cut", type=float, default=0.5, dest="qso_err_cut")
+parser.add_argument("--qso-err-cut", type=float, default=1.5, dest="qso_err_cut")
+parser.add_argument("--sne-err-cut", type=float, default=0.5, dest="sne_err_cut")
+parser.add_argument("--z-min", type=float, default=0.01, dest="z_min")
+parser.add_argument("--revised", action="store_true", help="Use full_dataset_revisado.csv instead of full_dataset.csv")
 parser.add_argument("--output-dir", type=str, default="chains", dest="output_dir")
 parser.add_argument("--no-nuisance", action="store_true", help="Fix calibration offsets (M_sne, M_qso) to 0")
 parser.add_argument("--asymmetric", action="store_true", help="γCDM without δM (test if γ absorbs offset)")
 parser.add_argument("--no-quasars", action="store_true", help="Exclude Quasars from analysis")
+parser.add_argument("--quasars-only", action="store_true", help="Evaluate Quasars only")
 parser.add_argument("--fixed-anchor", action="store_true", help="Fix H0=67.4 and M=SH0ES (M=0) for ALL models")
-parser.add_argument("--sanity-check", action="store_true", help="Battle Final: ΛCDM(H0=67.4,Ωm free,M free) vs γCDM/Decay(H0=67.4,M removed)")
+parser.add_argument("--sanity-check", action="store_true", help="Internal sanity check: ΛCDM(H0=67.4,Ωm free,M free) vs γCDM/Decay(H0=67.4,M removed)")
 args = parser.parse_args()
 
 print(f"=" * 70)
 print(f"🔮 NESTED SAMPLING: {args.model.upper()}")
 if args.no_quasars:
     print(f"   🔭 MODE: NO QUASARS (SNe + CC only)")
+elif args.quasars_only:
+    print(f"   🔭 MODE: QUASARS ONLY (QSO + CC)")
 print(f"=" * 70)
 
 # ============================================================================
@@ -43,26 +49,31 @@ import numpy as np
 import pandas as pd
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-csv_path = os.path.join(script_dir, "full_dataset.csv")
+dataset_name = 'full_dataset_revisado.csv' if args.revised else 'full_dataset.csv'
+csv_path = os.path.join(script_dir, dataset_name)
 
 if not os.path.exists(csv_path):
     # Try one level up if not in notebooks/
-    csv_path = os.path.join(os.path.dirname(script_dir), "full_dataset.csv")
+    csv_path = os.path.join(os.path.dirname(script_dir), dataset_name)
 
 if os.path.exists(csv_path):
     df = pd.read_csv(csv_path)
 else:
     # Fallback to GitHub if local fails
     print("⚠️ Local dataset not found, falling back to GitHub...")
-    df = pd.read_csv('https://raw.githubusercontent.com/indigenica/akashic-alpha-engine/main/full_dataset.csv')
+    df = pd.read_csv('https://raw.githubusercontent.com/indigenica/akashic-alpha-engine/main/' + dataset_name)
 
-# Filter and extract exactly as in gammacdm_anticheat_validation.py
-sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu')]
+# Filter and extract exactly as in gammacdm_anticheat_validation.py / gammacdm_addendum_verification.py
+sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min)]
 cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
 
 if args.no_quasars:
     qso = pd.DataFrame(columns=df.columns)
     mu_data = sne.copy()
+elif getattr(args, 'quasars_only', False):
+    sne = pd.DataFrame(columns=df.columns)
+    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    mu_data = qso.copy()
 else:
     qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
     mu_data = pd.concat([sne, qso])
@@ -159,7 +170,7 @@ if args.model == "lcdm":
     if args.sanity_check:
         print("   🧠 ΛCDM Sanity: M free, Ωm free (Fairer)")
         # params["omch2"] = 0.12  <-- REMOVED: Let it be free to fit Quasars
-    output_prefix = os.path.join(args.output_dir, "anticheat_lcdm")
+    output_prefix = os.path.join(args.output_dir, "nested_lcdm")
 elif args.model == "log2":
     LikelihoodClass = LOG2Likelihood
     params = base_params.copy()
@@ -176,7 +187,7 @@ elif args.model == "log2":
         print("   🔒 No-nuisance: M FIXED to 0 for γCDM-LOG²")
         params["M_sne"] = 0.0
         params["M_qso"] = 0.0
-    output_prefix = os.path.join(args.output_dir, "anticheat_log2")
+    output_prefix = os.path.join(args.output_dir, "nested_log2")
 elif args.model == "decay":
     LikelihoodClass = DecayLikelihood
     params = base_params.copy()
@@ -194,7 +205,7 @@ elif args.model == "decay":
         print("   🔒 No-nuisance: M FIXED to 0 for Decay model")
         params["M_sne"] = 0.0
         params["M_qso"] = 0.0
-    output_prefix = os.path.join(args.output_dir, "anticheat_decay")
+    output_prefix = os.path.join(args.output_dir, "nested_decay")
 elif args.model == "log_decay":
     LikelihoodClass = LogDecayLikelihood
     params = base_params.copy()
@@ -216,7 +227,7 @@ elif args.model == "log_decay":
         print("   🔒 No-nuisance: M FIXED to 0 for γCDM-LOG²-DECAY")
         params["M_sne"] = 0.0
         params["M_qso"] = 0.0
-    output_prefix = os.path.join(args.output_dir, "anticheat_log_decay")
+    output_prefix = os.path.join(args.output_dir, "nested_log_decay")
 
 sampler_cfg = {
     "polychord": {
@@ -235,6 +246,15 @@ info = {
     "output": output_prefix,
     "force": True
 }
+
+# Clean old chain files to prevent getdist from mixing old and new runs
+import glob
+for f in glob.glob(output_prefix + ".*") + glob.glob(output_prefix + "_*"):
+    if not f.endswith("_results.json"): # keep json if needed, but it will be overwritten anyway
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
 # ============================================================================
 # RUN
@@ -263,8 +283,21 @@ else:
         H0_mean = 67.4
         H0_std = 0.0
 
-M_sne_mean = float(np.mean(samples["M_sne"])) if "M_sne" in samples else 0.0
-M_qso_mean = float(np.mean(samples["M_qso"])) if "M_qso" in samples else 0.0
+def _get_val(key, default=0.0):
+    try:
+        # For SampleCollection/DataFrame
+        if hasattr(samples, 'get'):
+            val = samples.get(key)
+            if val is not None:
+                return float(np.mean(val))
+        if key in samples.columns if hasattr(samples, 'columns') else key in samples:
+            return float(np.mean(samples[key]))
+    except Exception:
+        pass
+    return default
+
+M_sne_mean = _get_val("M_sne")
+M_qso_mean = _get_val("M_qso")
 
 results = {
     "model": args.model,
@@ -360,7 +393,7 @@ elif args.model == "log_decay":
     print(f"   → H₀(local) implied: {h0_loc:.2f} km/s/Mpc (Bubble A={a_val:.3f})")
 
 # 4. Nuisance Parameters (M)
-is_fixed_m = args.sanity_check or args.no_nuisance or (args.asymmetric and args.model != "lcdm")
+is_fixed_m = (args.sanity_check or args.no_nuisance or args.asymmetric) and args.model != "lcdm"
 if is_fixed_m:
     print(f"   M_sne = 0.000 (Fixed), M_qso = 0.000 (Fixed)")
     print(f"   ⟨δM⟩  = 0.000 (Fixed)")
