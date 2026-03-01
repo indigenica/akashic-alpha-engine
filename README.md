@@ -98,17 +98,13 @@ The reproduction package does not implement the full official likelihood pipelin
 pip install camb pandas numpy scipy matplotlib cobaya
 
 python gammacdm_addendum_verification.py \
-    --fixed-anchor --qso-err-cut 10 \
-    --starts 30 --sigma-int-sne 0.1 --sigma-int-qso 0.4 \
-    --legacy
+    --revised --legacy --fixed-anchor --mock --nested
 ```
 
 ### Original Preprint (Gen I)
 ```bash
 jupyter notebook gammacdm_preprint_repro.ipynb
 ```
-
-**Note on MCMC/Nested Sampling:** Due to limited computational resources, full MCMC and Nested Sampling convergence has not yet been achieved. The MLE results (30 multi-start optimizations) are robust and reproducible. MCMC/Nested results will be included in a future revision.
 
 ---
 
