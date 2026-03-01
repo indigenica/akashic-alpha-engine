@@ -1,9 +1,9 @@
-# Reproduction Package: Topological Horizon Lensing Framework (γCDM)
+# Topological Horizon Lensing Framework (γCDM)
 
 **Preprint:** [Topological Horizon Lensing: γCDM Correction to Luminosity Distances](https://doi.org/10.5281/zenodo.18401999)  
 **Author:** Bautista, 2026
 
-This repository contains the **reproduction code** and dataset required to independently verify the numerical results, tables, and phenomenological conclusions presented in the associated preprint.
+This repository contains the **reproduction code** and dataset required to independently verify the numerical results, tables, phenomenological conclusions and methodology presented in the associated preprint.
 
 ## Overview
 The results reported in the paper were originally obtained using a custom research framework implemented in JAX, incorporating machine learning–assisted exploration tools (internally referred to as the Akashic Alpha Engine). That framework was used to explore patterns, test phenomenological hypotheses, and guide physical intuition.
@@ -41,6 +41,15 @@ $$\Delta\mu(z) = A \cdot e^{-z/z_b} + \gamma_0 \cdot [\ln(1+z)]^2 \cdot e^{-z/z_
 | II | LOG³ | 4 | SNe+QSO+CC | −696 | −702 | Not cubic—truly quadratic |
 | III | Decay | 5 | SNe+QSO+CC | −540 | −553 | Alleviated H₀, no structure |
 | III | **LOG²-Decay** | **7** | **SNe+QSO+CC** | **−735** | **−760** | **Full alleviation** |
+
+<p align="center">
+  <img width="48%" alt="mcmc_log_decay_full_corner" src="https://github.com/user-attachments/assets/0f4a2469-79e4-4ddd-9652-361313c0d1f1" />
+  <img width="48%" alt="nested_log_decay_full_corner" src="https://github.com/user-attachments/assets/3efeb680-8d23-4abe-927e-a7a9a0de0d67" />
+</p>
+
+<p align="center">
+  <em><b>Left:</b> Cobaya MCMC. <b>Right:</b> Cobaya Nested Sampling (PolyChord). </em>
+</p>
 
 ---
 
