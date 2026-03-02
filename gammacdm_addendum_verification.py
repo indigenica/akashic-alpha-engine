@@ -1891,11 +1891,10 @@ else:
 
 # ============================================================================
 # MOCK TEST: γ=0 NULL HYPOTHESIS (pipeline validation)
-# Only run here if NOT using MCMC or nested; otherwise it runs after sampling
 # ============================================================================
-if args.mock and not args.mcmc and not args.nested:
+def run_mock_test(title_suffix=""):
     print("\n" + "=" * 70)
-    print("🧪 MOCK TEST: VALIDACIÓN γ=0 (null hypothesis)")
+    print(f"🧪 MOCK TEST{title_suffix}: VALIDACIÓN γ=0 (null hypothesis)")
     print("=" * 70)
     print(f"""
    Objetivo: verificar que el pipeline NO fabrica señal γ espuria.
@@ -1930,13 +1929,46 @@ if args.mock and not args.mcmc and not args.nested:
 
     for m in range(args.n_mock):
         # Generate noisy mock data
-        z_mu = _z_mu
-        err_mu = _err_mu
-        mu_obs = mu_theory + rng.normal(0, _err_mu)
+        global z_mu_g, mu_obs_g, err_mu_g, z_cc_g, H_obs_g, err_cc_g
+        z_mu_m = _z_mu
+        err_mu_m = _err_mu
+        mu_obs_m = mu_theory + rng.normal(0, _err_mu)
 
-        z_cc = _z_cc
-        err_cc = _err_cc
-        H_obs = H_theory + rng.normal(0, _err_cc) if len(_err_cc) > 0 else np.array([])
+        z_cc_m = _z_cc
+        err_cc_m = _err_cc
+        H_obs_m = H_theory + rng.normal(0, _err_cc) if len(_err_cc) > 0 else np.array([])
+
+        # Determine degrees of freedom dynamically for proper BIC
+        k_lcdm = 4 if COMBINED_MODE else 3
+        k_gcdm = 5 if COMBINED_MODE else 4
+
+        # Wrap chi2 evaluation to ensure isolation from global args and inject mock data
+        def chi2_lcdm_mock(params):
+            orig_fa, orig_sc, orig_nn, orig_asym = args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric
+            args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = False, False, False, False
+            global z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
+            _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc = z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
+            z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = z_mu_m, mu_obs_m, err_mu_m, z_cc_m, H_obs_m, err_cc_m
+            try:
+                val = chi2_lcdm(params)
+            finally:
+                 args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = orig_fa, orig_sc, orig_nn, orig_asym
+                 z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc
+            return val
+
+        def chi2_gcdm_mock(params):
+            orig_fa, orig_sc, orig_nn, orig_asym = args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric
+            args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = False, False, False, False
+            global z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
+            _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc = z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
+            z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = z_mu_m, mu_obs_m, err_mu_m, z_cc_m, H_obs_m, err_cc_m
+            try:
+                val = chi2_gcdm(params)
+            finally:
+                 args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = orig_fa, orig_sc, orig_nn, orig_asym
+                 z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc
+            return val
+
 
         # Fit ΛCDM
         best_lcdm_m = np.inf
@@ -1948,7 +1980,7 @@ if args.mock and not args.mcmc and not args.nested:
                 x0 = [rng.uniform(50, 90), rng.uniform(0.05, 0.20),
                       rng.uniform(-1.0, 1.0)]
             try:
-                res = minimize(chi2_lcdm, x0, method='Nelder-Mead',
+                res = minimize(chi2_lcdm_mock, x0, method='Nelder-Mead',
                                options={'maxiter': 5000, 'xatol': 1e-6})
                 if res.fun < best_lcdm_m:
                     best_lcdm_m = res.fun
@@ -1967,7 +1999,7 @@ if args.mock and not args.mcmc and not args.nested:
                 x0 = [rng.uniform(50, 90), rng.uniform(0.05, 0.20),
                       rng.uniform(-1.0, 1.0), rng.uniform(-1.5, 0.5)]
             try:
-                res = minimize(chi2_gcdm, x0, method='Nelder-Mead',
+                res = minimize(chi2_gcdm_mock, x0, method='Nelder-Mead',
                                options={'maxiter': 5000, 'xatol': 1e-6})
                 if res.fun < best_gcdm_m:
                     best_gcdm_m = res.fun
@@ -1991,10 +2023,6 @@ if args.mock and not args.mcmc and not args.nested:
             false_detections += 1
 
         print(f"   Mock {m+1:>3}/{args.n_mock}: γ = {best_gamma_m:+.4f}, ΔBIC = {dbic_m:+.1f}, ΔAIC = {daic_m:+.1f}")
-
-    # Restore real data
-    z_mu, mu_obs, err_mu = _z_mu, _mu_obs, _err_mu
-    z_cc, H_obs, err_cc = _z_cc, _H_obs, _err_cc
 
     # Summary
     mock_gammas = np.array(mock_gammas)
@@ -2026,6 +2054,9 @@ if args.mock and not args.mcmc and not args.nested:
     else:
         print(f"\n   ⚠️  {false_detections} falsas alarmas → revisar pipeline")
 
+# Run mock test
+if args.mock: # and not args.mcmc and not args.nested:
+    run_mock_test()
 
 # ============================================================================
 # MCMC / NESTED SAMPLING VALIDATION (optional)
@@ -2934,116 +2965,8 @@ if args.mcmc or args.nested:
     # ========================================================================
     # MOCK TEST AFTER MCMC: γ=0 NULL HYPOTHESIS (uses MCMC posteriors)
     # ========================================================================
-    if args.mock:
-        print("\n" + "=" * 70)
-        print("🧪 MOCK TEST POST-MCMC: VALIDACIÓN γ=0 (null hypothesis)")
-        print("=" * 70)
-        print(f"""
-   Objetivo: verificar que el pipeline NO fabrica señal γ espuria.
-   Procedimiento:
-     1. Generar datos sintéticos con ΛCDM puro (γ=0, H₀=67.4)
-     2. Usar las mismas barras de error y redshifts que los datos reales
-     3. Ajustar ΛCDM y γCDM al mock
-     4. Verificar que γ ≈ 0 y ΔBIC ≈ 0 (o positivo)
-   Realizaciones: {args.n_mock}
-""")
-
-        # Save real data
-        _z_mu, _mu_obs, _err_mu = z_mu.copy(), mu_obs.copy(), err_mu.copy()
-        _z_cc, _H_obs, _err_cc = z_cc.copy(), H_obs.copy(), err_cc.copy()
-
-        # Truth cosmology: Planck ΛCDM
-        H0_truth = 67.4
-        omch2_truth = 0.12
-        pars_truth = camb.CAMBparams()
-        pars_truth.set_cosmology(H0=H0_truth, ombh2=0.0224, omch2=omch2_truth)
-        r_truth = camb.get_background(pars_truth)
-
-        mu_theory = 5 * np.log10(r_truth.luminosity_distance(_z_mu)) + 25
-        H_theory = r_truth.hubble_parameter(_z_cc) if len(_z_cc) > 0 else np.array([])
-
-        mock_gammas = []
-        mock_dbics = []
-        mock_daics = []
-        false_detections = 0
-
-        rng = np.random.RandomState(123)
-
-        for m in range(args.n_mock):
-            # Generate noisy mock data
-            z_mu = _z_mu
-            err_mu = _err_mu
-            mu_obs = mu_theory + rng.normal(0, _err_mu)
-
-            z_cc = _z_cc
-            err_cc = _err_cc
-            H_obs = H_theory + rng.normal(0, _err_cc) if len(_err_cc) > 0 else np.array([])
-
-            # Fit both models to mock
-            if COMBINED_MODE:
-                x0_l = [67.4 + rng.normal(0, 3), 0.12 + rng.normal(0, 0.02), 0.0, 0.0]
-                x0_g = [67.4 + rng.normal(0, 3), 0.12 + rng.normal(0, 0.02), 0.0, 0.0, 0.0]
-            else:
-                x0_l = [67.4 + rng.normal(0, 3), 0.12 + rng.normal(0, 0.02), 0.0]
-                x0_g = [67.4 + rng.normal(0, 3), 0.12 + rng.normal(0, 0.02), 0.0, 0.0]
-
-            res_mock_l = minimize(chi2_lcdm, x0_l, method='Nelder-Mead', options={'maxiter': 5000, 'xatol': 1e-6, 'fatol': 1e-6})
-            res_mock_g = minimize(chi2_gcdm, x0_g, method='Nelder-Mead', options={'maxiter': 5000, 'xatol': 1e-6, 'fatol': 1e-6})
-
-            # Extract results
-            chi2_l = res_mock_l.fun
-            chi2_g = res_mock_g.fun
-            k_l = len(x0_l)
-            k_g = len(x0_g)
-            N_mock = len(z_mu) + len(z_cc)
-
-            bic_l = chi2_l + k_l * np.log(N_mock)
-            bic_g = chi2_g + k_g * np.log(N_mock)
-            aic_l = chi2_l + 2 * k_l
-            aic_g = chi2_g + 2 * k_g
-
-            dbic_mock = bic_g - bic_l
-            daic_mock = aic_g - aic_l
-            gamma_mock = res_mock_g.x[-1] if not COMBINED_MODE else res_mock_g.x[4]
-
-            mock_gammas.append(gamma_mock)
-            mock_dbics.append(dbic_mock)
-            mock_daics.append(daic_mock)
-
-            if dbic_mock < -6:
-                false_detections += 1
-
-            if (m + 1) % 5 == 0 or m == 0:
-                print(f"   Mock {m+1:2d}/{args.n_mock}: γ = {gamma_mock:+.4f}, ΔBIC = {dbic_mock:+.1f}")
-
-        # Restore real data
-        z_mu, mu_obs, err_mu = _z_mu, _mu_obs, _err_mu
-        z_cc, H_obs, err_cc = _z_cc, _H_obs, _err_cc
-
-        # Summary
-        print(f"\n" + "-" * 70)
-        print(f"   📊 RESUMEN MOCK TEST (γ=0 verdad):")
-        print(f"   ⟨γ⟩ mock    = {np.mean(mock_gammas):+.4f} ± {np.std(mock_gammas):.4f}")
-        print(f"   ⟨ΔBIC⟩ mock = {np.mean(mock_dbics):+.1f} ± {np.std(mock_dbics):.1f}")
-        print(f"   ⟨ΔAIC⟩ mock = {np.mean(mock_daics):+.1f} ± {np.std(mock_daics):.1f}")
-        print(f"   Falsas alarmas = {false_detections}/{args.n_mock} (ΔBIC < −6)")
-
-        print(f"\n   COMPARACIÓN con datos REALES:")
-        print(f"   {'':<20} {'Mock (γ=0)':<15} {'Real':<15}")
-        print(f"   {'γ':<20} {np.mean(mock_gammas):+15.4f} {gamma_g:+15.4f}")
-        print(f"   {'ΔBIC':<20} {np.mean(mock_dbics):+15.1f} {delta_bic:+15.1f}")
-
-        # Verdict
-        sigma_gamma = abs(gamma_g - np.mean(mock_gammas)) / max(np.std(mock_gammas), 1e-6)
-        print(f"\n   Separación γ_real vs γ_mock: {sigma_gamma:.1f}σ")
-
-        if false_detections == 0 and abs(np.mean(mock_gammas)) < 0.1:
-            print(f"\n   ✅ PIPELINE VALIDADO: no fabrica señal γ espuria")
-            print(f"      La señal γ = {gamma_g:.4f} en datos reales es GENUINA")
-        elif false_detections <= 1:
-            print(f"\n   ✅ Pipeline limpio ({false_detections} falsa alarma aceptable)")
-        else:
-            print(f"\n   ⚠️  {false_detections} falsas alarmas → revisar pipeline")
+    # if args.mock:
+    #     run_mock_test(title_suffix=" POST-MCMC")
 
 # ============================================================================
 # RESUMEN FINAL
