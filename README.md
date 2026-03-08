@@ -67,7 +67,7 @@ The analysis was refined by incorporating 2,397 high-redshift quasars (z ≤ 7.0
 
 ---
 
-## Hardened Robustness Protocol
+## Hardened Analysis Protocol
 To ensure the statistical validity of the results, a validation suite is provided to test the model under a strict anti-cheat protocol:
 *   **Physical Priors:** Enforces **Ωm < 1** (flat ΛCDM with ΩΛ ≥ 0).
 *   **Calibration Neutrality:** Independent nuisance parameters (**δM**) for SNe and Quasars with identical wide priors.
@@ -77,8 +77,9 @@ To ensure the statistical validity of the results, a validation suite is provide
 ---
 
 ## Contents
-*   `gammacdm_preprint_repro.ipynb`: Reproduction notebook for the original linear-log analysis (Gen I).
-*   `gammacdm_addendum_verification.py`: Main validation suite. Implements multi-start MLE, MCMC (Cobaya), Nested Sampling (PolyChord), and Mock Tests for all model generations.
+*   `gammacdm_repro_gen1.ipynb`: Reproduction notebook for the original linear-log analysis (Gen I).
+*   `gammacdm_verification.py`: Main validation suite. Implements multi-start MLE, MCMC (Cobaya), Nested Sampling (PolyChord), and Mock Tests for all model generations.
+*   `gammacdm_likelihoods.py`: Shared likelihoods.
 *   `run_nested_single.py`: Runner for isolated Nested Sampling processes (requires PolyChord).
 *   `full_dataset.csv`: The curated dataset (SNe Ia + Quasars + Cosmic Chronometers).
 
@@ -97,13 +98,13 @@ The reproduction package does not implement the full official likelihood pipelin
 ```bash
 pip install camb pandas numpy scipy matplotlib cobaya
 
-python gammacdm_addendum_verification.py \
+python gammacdm_verification.py \
     --revised --legacy --fixed-anchor --mock --nested
 ```
 
 ### Original Preprint (Gen I)
 ```bash
-jupyter notebook gammacdm_preprint_repro.ipynb
+jupyter notebook gammacdm_repro_gen1.ipynb
 ```
 
 ---
