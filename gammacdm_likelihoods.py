@@ -3,7 +3,7 @@
 γCDM Cobaya Likelihood Module
 ==============================
 Single source of truth for all model likelihoods used in both
-MCMC (gammacdm_addendum_verification.py) and Nested Sampling (run_nested_single.py).
+MCMC (gammacdm_verification.py) and Nested Sampling (run_nested_single.py).
 
 Models implemented:
   1. ΛCDM                — Standard model (no correction)

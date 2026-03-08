@@ -63,7 +63,7 @@ else:
     print("⚠️ Local dataset not found, falling back to GitHub...")
     df = pd.read_csv('https://raw.githubusercontent.com/indigenica/akashic-alpha-engine/main/' + dataset_name)
 
-# Filter and extract exactly as in gammacdm_anticheat_validation.py / gammacdm_addendum_verification.py
+# Filter and extract exactly as in gammacdm_verification.py
 sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min)]
 cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
 
