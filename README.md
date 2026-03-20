@@ -39,8 +39,8 @@ $$\Delta\mu(z) = A \cdot e^{-z/z_b} + \gamma_0 \cdot [\ln(1+z)]^2 \cdot e^{-z/z_
 | II | LOG² | 4 | SNe+QSO+CC | −739 | −745 | Dominant, but CMB-incompatible |
 | II | LINEAR | 4 | SNe+QSO+CC | −678 | −685 | Strong, but weaker than LOG² |
 | II | LOG³ | 4 | SNe+QSO+CC | −696 | −702 | Not cubic—truly quadratic |
-| III | Decay | 5 | SNe+QSO+CC | −540 | −553 | Alleviated H₀, no structure |
-| III | **LOG²-Decay** | **7** | **SNe+QSO+CC** | **−735** | **−760** | **Full alleviation** |
+| III | Decay | 5 | SNe+QSO+CC | −536 | −550 | Alleviated H₀, no structure |
+| III | **LOG²-Decay** | **7** | **SNe+QSO+CC** | **−760** | **−785** | **Full alleviation** |
 
 <p align="center">
   <img width="48%" alt="mcmc_log_decay_full_corner" src="https://github.com/user-attachments/assets/0f4a2469-79e4-4ddd-9652-361313c0d1f1" />
@@ -82,7 +82,7 @@ To ensure the statistical validity of the results, a validation suite is provide
 *   `gammacdm_likelihoods.py`: Shared likelihoods.
 *   `run_nested_single.py`: Runner for isolated Nested Sampling processes (requires PolyChord).
 *   `full_dataset.csv`: The curated dataset (SNe Ia + Quasars + Cosmic Chronometers).
-
+*   `Pantheon+SH0ES_STATONLY.cov & Pantheon+SH0ES_STAT+SYS.cov`:  Covariance matrices are provided in [PantheonPlusSH0ES/DataRelease](https://github.com/PantheonPlusSH0ES/DataRelease/tree/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR)
 ---
 
 ## Scope and Interpretation
