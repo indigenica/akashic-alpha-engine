@@ -32,6 +32,11 @@ parser.add_argument("--no-quasars", action="store_true", help="Exclude Quasars f
 parser.add_argument("--quasars-only", action="store_true", help="Evaluate Quasars only")
 parser.add_argument("--fixed-anchor", action="store_true", help="Fix H0=67.4 and M=SH0ES (M=0) for ALL models")
 parser.add_argument("--sanity-check", action="store_true", help="Internal sanity check: ΛCDM(H0=67.4,Ωm free,M free) vs γCDM/Decay(H0=67.4,M removed)")
+parser.add_argument("--student", action="store_true", help="Use Student-t likelihood (robust to outliers, default ν=5)")
+parser.add_argument("--cauchy", action="store_true", help="Use Cauchy likelihood (ν=1, maximum robustness)")
+parser.add_argument("--nu", type=float, default=5.0, help="Degrees of freedom for Student-t (default: 5.0)")
+parser.add_argument("--cov", type=str, default="none", choices=["none", "stat", "sys"],
+                    help="Covariance matrix type for SNe Ia (default: 'none')")
 args = parser.parse_args()
 
 print(f"=" * 70)
@@ -41,6 +46,20 @@ if args.no_quasars:
 elif args.quasars_only:
     print(f"   🔭 MODE: QUASARS ONLY (QSO + CC)")
 print(f"=" * 70)
+
+# Resolve likelihood type
+if args.cauchy:
+    _lk_type = 'cauchy'
+    _nu_val = 1.0
+    print(f"   ⚙️  Likelihood: CAUCHY (ν=1)")
+elif args.student:
+    _lk_type = 'student'
+    _nu_val = args.nu
+    print(f"   ⚙️  Likelihood: Student-t (ν={_nu_val:.1f})")
+else:
+    _lk_type = 'gaussian'
+    _nu_val = 5.0
+    print(f"   ⚙️  Likelihood: Gaussian")
 
 # ============================================================================
 # LOAD DATA (unified from full_dataset.csv)
@@ -104,6 +123,40 @@ print(f"📊 Dataset: {n_sne} SNe + {n_qso} QSOs + {len(cc)} CC")
 print(f"📊 Total points N = {N}")
 
 # ============================================================================
+# COVARIANCE MATRIX (optional, Pantheon+)
+# ============================================================================
+C_inv_sne = None
+ln_det_C_sne = None
+
+if args.cov != 'none' and n_sne > 0:
+    cov_file = "Pantheon+SH0ES_STATONLY.cov" if args.cov == 'stat' else "Pantheon+SH0ES_STAT+SYS.cov"
+    cov_path = os.path.join(script_dir, cov_file)
+
+    if os.path.exists(cov_path):
+        print(f"🧮 Loading SNe Covariance: {cov_file}")
+        with open(cov_path, 'r') as f:
+            C_dim = int(f.readline().strip())
+        C_flat = np.loadtxt(cov_path, skiprows=1)
+        C_full = C_flat.reshape(C_dim, C_dim)
+
+        sne_all = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu')].copy()
+        sne_all['cov_idx'] = np.arange(len(sne_all))
+        sne_filt = sne_all[(sne_all['err'] < args.sne_err_cut) & (sne_all['z'] > args.z_min)]
+        sne_idx = sne_filt['cov_idx'].values.astype(int)
+
+        C_sne = C_full[np.ix_(sne_idx, sne_idx)]
+        if args.sigma_int_sne > 0:
+            np.fill_diagonal(C_sne, C_sne.diagonal() + args.sigma_int_sne**2)
+
+        C_inv_sne = np.linalg.inv(C_sne)
+        sign, ln_det_C_sne = np.linalg.slogdet(C_sne)
+        if sign <= 0:
+            raise ValueError("SNe covariance determinant is not positive.")
+        print(f"   ✅ Covariance ready ({len(sne_idx)}×{len(sne_idx)})")
+    else:
+        print(f"   ⚠️ Covariance file not found: {cov_path}, using diagonal errors")
+
+# ============================================================================
 # SETUP LIKELIHOOD (shared module)
 # ============================================================================
 from cobaya.run import run
@@ -113,10 +166,12 @@ LCDMLikelihood, GammaCDM_LOG2_Likelihood, DecayLikelihood, LogDecayLikelihood = 
     create_likelihoods(
         z_mu=z_mu, mu_obs=mu_obs, err_mu=err_mu,
         z_cc=z_cc, H_obs=H_obs, err_cc=err_cc,
-        sne_mask=sne_mask, combined_mode=True,  # nested always uses combined sne+qso
+        sne_mask=sne_mask, combined_mode=True,
         sigma_int_sne=SIGMA_INT_SNE, sigma_int_qso=SIGMA_INT_QSO,
         no_nuisance=args.no_nuisance, asymmetric=args.asymmetric,
-        sanity_check=args.sanity_check
+        sanity_check=args.sanity_check,
+        likelihood_type=_lk_type, nu=_nu_val,
+        C_inv_sne=C_inv_sne, ln_det_C_sne=ln_det_C_sne
     )
 # Alias for backward compat with model selection below
 LOG2Likelihood = GammaCDM_LOG2_Likelihood
@@ -129,7 +184,7 @@ print("   ✅ Shared likelihoods loaded from gammacdm_likelihoods.py")
 # ============================================================================
 base_params = {
     "H0": {"prior": {"min": 40, "max": 100}, "ref": 70, "proposal": 2.0},
-    "omch2": {"prior": {"min": 0.01, "max": 0.35}, "ref": 0.12, "proposal": 0.02},
+    "omch2": {"prior": {"min": 0.05, "max": 0.35}, "ref": 0.12, "proposal": 0.02},
     "M_sne": {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05},
     "M_qso": {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05},
     "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06
@@ -270,7 +325,7 @@ logZ = sampler.products().get("logZ", None)
 if logZ is None:
     logZ = getattr(sampler, 'logZ', None)
 
-if args.model == "decay" or args.fixed_anchor or args.sanity_check:
+if args.fixed_anchor or args.sanity_check:
     # H0 is fixed
     H0_mean = 67.4
     H0_std = 0.0

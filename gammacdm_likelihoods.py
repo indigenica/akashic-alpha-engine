@@ -11,12 +11,16 @@ Models implemented:
   3. γCDM-Decay          — Δμ = A·exp(-z/zd)
   4. γCDM-LOG²-Decay     — Δμ = A·exp(-z/zb) + γ₀·[ln(1+z)]²·exp(-z/zh)
 
-Log-likelihood:
+Log-likelihood (default Gaussian):
   -2 ln L = Σ [(μ_obs - μ_th)² / σ_eff²]  +  Σ [ln(σ_eff²)]
             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^      ^^^^^^^^^^^^^^^^
             chi-squared term                  normalization term
 
   σ_eff² = σ_obs² + σ_int²  (intrinsic scatter added in quadrature)
+
+Robust alternatives (--student / --cauchy):
+  Student-t(ν):  ln L_i = −ln(σ) − (ν+1)/2 · ln(1 + r²/(ν·σ²))
+  Cauchy:        Student-t with ν = 1 (heaviest tails, maximum robustness)
 
 References:
   - Pantheon+: Brout et al. (2022), arXiv:2202.04077
@@ -30,7 +34,9 @@ import numpy as np
 def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                        sne_mask, combined_mode,
                        sigma_int_sne=0.0, sigma_int_qso=0.0,
-                       no_nuisance=False, asymmetric=False, sanity_check=False):
+                       no_nuisance=False, asymmetric=False, sanity_check=False,
+                       likelihood_type='gaussian', nu=5.0,
+                       C_inv_sne=None, ln_det_C_sne=None):
     """
     Factory that creates 4 configured Cobaya Likelihood classes.
 
@@ -63,6 +69,15 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
         If True, remove M entirely from γCDM/Decay (ΛCDM keeps M free).
     sanity_check : bool
         If True, H0 fixed, M removed from γCDM/Decay.
+    likelihood_type : str
+        'gaussian' (default), 'student', or 'cauchy'.
+    nu : float
+        Degrees of freedom for Student-t (default 5.0, ignored for Gaussian/Cauchy).
+    C_inv_sne : np.ndarray or None
+        Inverse of the SNe Ia covariance matrix (already includes σ_int on diagonal).
+        When provided, SNe are evaluated with the full correlated Gaussian likelihood.
+    ln_det_C_sne : float or None
+        log-determinant of the SNe Ia covariance matrix.
 
     Returns
     -------
@@ -72,24 +87,79 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
     from cobaya.likelihood import Likelihood
 
     # ── Precompute effective errors (σ_obs ⊕ σ_int) ──
+    # In combined mode, SNe and QSOs get their respective σ_int.
+    # In non-combined mode (--no-quasars or --quasars-only), we infer the
+    # appropriate scatter: if there is a sne_mask and it has any True entries
+    # we use sigma_int_sne; otherwise we use sigma_int_qso.
     if combined_mode:
         sigma_int = np.where(sne_mask, sigma_int_sne, sigma_int_qso)
     else:
-        sigma_int = np.full_like(err_mu, sigma_int_sne)
+        has_sne = sne_mask is not None and np.any(sne_mask)
+        sigma_int_val = sigma_int_sne if has_sne else sigma_int_qso
+        sigma_int = np.full_like(err_mu, sigma_int_val)
     err_eff = np.sqrt(err_mu**2 + sigma_int**2)
 
-    # Normalization constants (log-determinant of covariance)
-    norm_mu = np.sum(np.log(err_eff**2))
     norm_cc = np.sum(np.log(err_cc**2)) if len(z_cc) > 0 else 0.0
 
     # Should this model have its M zeroed out?
     restrict_m = no_nuisance or asymmetric or sanity_check
 
+    # ── Covariance bookkeeping ──
+    _use_cov = C_inv_sne is not None and ln_det_C_sne is not None
+    _qso_mask = ~sne_mask if (combined_mode and sne_mask is not None) else None
+
+    # Resolve effective ν for Student-t / Cauchy
+    _ltype = likelihood_type.lower()
+    if _ltype == 'cauchy':
+        _nu_eff = 1.0
+        _ltype = 'student'   # Cauchy = Student-t(ν=1)
+    elif _ltype == 'student':
+        _nu_eff = float(nu)
+    else:
+        _nu_eff = None        # Gaussian — unused
+
     # ================================================================
-    # Helper: compute base μ_th from angular diameter distance
+    # Helper: log-likelihood for μ residuals (robust or Gaussian)
     # ================================================================
-    # (not a method — just documenting the shared logic)
-    # DA → DL = DA·(1+z)², μ = 5·log10(DL) + 25
+    #   residuals = μ_obs − μ_th   (array, full length)
+    #   sigma     = σ_eff           (array, same shape)
+    #
+    # When C_inv_sne is provided, SNe Ia are evaluated with the full
+    # correlated Gaussian: R_sne^T C^{-1} R_sne + ln|C|.
+    # Remaining points (QSOs, or all if no cov) use the diagonal evaluator.
+    # CC H(z) data keeps plain Gaussian — no outlier problem there.
+    # ================================================================
+    def _logL_mu(residuals, sigma):
+        """Compute log-likelihood for distance-modulus data."""
+        logL = 0.0
+
+        if _use_cov:
+            if combined_mode and sne_mask is not None:
+                res_sne = residuals[sne_mask]
+                res_diag = residuals[_qso_mask]
+                sig_diag = sigma[_qso_mask]
+            else:
+                res_sne = residuals
+                res_diag = np.array([])
+                sig_diag = np.array([])
+
+            logL += -0.5 * (res_sne @ C_inv_sne @ res_sne + ln_det_C_sne)
+        else:
+            res_diag = residuals
+            sig_diag = sigma
+
+        if len(res_diag) > 0:
+            if _ltype == 'student':
+                r2 = res_diag**2
+                s2 = sig_diag**2
+                logL += np.sum(-np.log(sig_diag)
+                               - (_nu_eff + 1) / 2 * np.log1p(r2 / (_nu_eff * s2 + 1e-30)))
+            else:
+                logL += -0.5 * (np.sum((res_diag / sig_diag)**2)
+                                + np.sum(np.log(sig_diag**2)))
+
+        return logL
+
 
     # ================================================================
     # 1. ΛCDM  —  No model correction
@@ -110,7 +180,6 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             self.z_mu = z_mu
             self.mu_obs = mu_obs
             self.err_eff = err_eff
-            self.norm_mu = norm_mu
             self.sne_mask = sne_mask
             self.combined = combined_mode
             self.z_cc = z_cc
@@ -141,8 +210,8 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             else:
                 mu_th = mu_th + pv.get('mabs', 0.0)
 
-            # -2 ln L = χ² + normalization
-            logL = -0.5 * (np.sum(((self.mu_obs - mu_th) / self.err_eff)**2) + self.norm_mu)
+            # Log-likelihood (may be Gaussian, Student-t, or Cauchy)
+            logL = _logL_mu(self.mu_obs - mu_th, self.err_eff)
 
             if len(self.z_cc) > 0:
                 H_th = self.provider.get_Hubble(self.z_cc)
@@ -169,7 +238,6 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             self.z_mu = z_mu
             self.mu_obs = mu_obs
             self.err_eff = err_eff
-            self.norm_mu = norm_mu
             self.sne_mask = sne_mask
             self.combined = combined_mode
             self.z_cc = z_cc
@@ -204,7 +272,7 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 else:
                     mu_th = mu_th + pv.get('mabs', 0.0)
 
-            logL = -0.5 * (np.sum(((self.mu_obs - mu_th) / self.err_eff)**2) + self.norm_mu)
+            logL = _logL_mu(self.mu_obs - mu_th, self.err_eff)
 
             if len(self.z_cc) > 0:
                 H_th = self.provider.get_Hubble(self.z_cc)
@@ -232,7 +300,6 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             self.z_mu = z_mu
             self.mu_obs = mu_obs
             self.err_eff = err_eff
-            self.norm_mu = norm_mu
             self.sne_mask = sne_mask
             self.combined = combined_mode
             self.z_cc = z_cc
@@ -268,7 +335,7 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 else:
                     mu_th = mu_th + pv.get('mabs', 0.0)
 
-            logL = -0.5 * (np.sum(((self.mu_obs - mu_th) / self.err_eff)**2) + self.norm_mu)
+            logL = _logL_mu(self.mu_obs - mu_th, self.err_eff)
 
             if len(self.z_cc) > 0:
                 H_th = self.provider.get_Hubble(self.z_cc)
@@ -322,7 +389,6 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             self.z_mu = z_mu
             self.mu_obs = mu_obs
             self.err_eff = err_eff
-            self.norm_mu = norm_mu
             self.sne_mask = sne_mask
             self.combined = combined_mode
             self.z_cc = z_cc
@@ -364,7 +430,7 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 else:
                     mu_th = mu_th + pv.get('mabs', 0.0)
 
-            logL = -0.5 * (np.sum(((self.mu_obs - mu_th) / self.err_eff)**2) + self.norm_mu)
+            logL = _logL_mu(self.mu_obs - mu_th, self.err_eff)
 
             if len(self.z_cc) > 0:
                 H_th = self.provider.get_Hubble(self.z_cc)

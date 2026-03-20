@@ -250,6 +250,11 @@ parser.add_argument("--sanity-check", action="store_true", dest="sanity_check",
                     help="Internal sanity check: ΛCDM(H0=67.4,Ωm=0.315,M free) vs γCDM/Decay(H0=67.4,M removed)")
 parser.add_argument("--output-dir", type=str, default="chains", help="Output directory for nested sampling chains")
 parser.add_argument("--legacy", action="store_true", help="Include legacy models (γCDM-LINEAL, γCDM-LOG³) in MLE analysis")
+parser.add_argument("--student", action="store_true", help="Use Student-t likelihood (robust to outliers, default ν=5)")
+parser.add_argument("--cauchy", action="store_true", help="Use Cauchy likelihood (ν=1, maximum robustness)")
+parser.add_argument("--nu", type=float, default=5.0, help="Degrees of freedom for Student-t (default: 5.0)")
+parser.add_argument("--cov", type=str, default="none", choices=["none", "stat", "sys"],
+                    help="Covariance matrix type for SNe Ia (default: 'none', 'stat' for STATONLY, 'sys' for STAT+SYS)")
 args = parser.parse_args()
 
 
@@ -262,6 +267,20 @@ print("=" * 70)
 print(f"   ⚙️  Intrinsic scatter: σ_int,SNe = {args.sigma_int_sne:.2f}, σ_int,QSO = {args.sigma_int_qso:.2f}")
 print(f"   ⚙️  Physical prior: Ωm < 1 enforced (flat ΛCDM with ΩΛ ≥ 0)")
 
+# ── Determine likelihood type ──
+if args.cauchy:
+    LIKELIHOOD_TYPE = 'cauchy'
+    NU_DOF = 1.0
+    print(f"   ⚙️  Likelihood: CAUCHY (ν=1, maximum robustness)")
+elif args.student:
+    LIKELIHOOD_TYPE = 'student'
+    NU_DOF = args.nu
+    print(f"   ⚙️  Likelihood: Student-t (ν={NU_DOF:.1f})")
+else:
+    LIKELIHOOD_TYPE = 'gaussian'
+    NU_DOF = None
+    print(f"   ⚙️  Likelihood: Gaussian (canonical)")
+
 # Try local first, then GitHub
 dataset_name = 'full_dataset_revisado.csv' if args.revised else 'full_dataset.csv'
 try:
@@ -271,6 +290,18 @@ except Exception:
         df = pd.read_csv('../' + dataset_name)
     except Exception:
         df = pd.read_csv('https://raw.githubusercontent.com/indigenica/akashic-alpha-engine/main/' + dataset_name)
+
+# ============================================================================
+# COVARIANCE MATRIX LOADING (PANTHEON+)
+# ============================================================================
+# The full_dataset.csv maintains the exact order of the 1701 Pantheon+ SNe Ia
+# at the beginning of the file. So the original index is simply their row number.
+sne_all = df[df['probe'] == 'sne_ia'].copy()
+sne_all['cov_idx'] = np.arange(len(sne_all))
+
+# Replace the original SNe records with these tracking ones
+df.loc[df['probe'] == 'sne_ia', 'cov_idx'] = sne_all['cov_idx'].values
+
 
 if args.quasars_only:
     # ── QUASARS ONLY (high-z test) ──
@@ -355,6 +386,46 @@ if not COMBINED_MODE:
     sne_mask = None
     qso_mask = None
 
+# Extract Covariance Matrix if requested and applicable
+C_inv_sne = None
+ln_det_C_sne = None
+
+if args.cov != 'none' and not args.quasars_only:
+    # Build file path
+    cov_file = f"Pantheon+SH0ES_STATONLY.cov" if args.cov == 'stat' else f"Pantheon+SH0ES_STAT+SYS.cov"
+    
+    if not os.path.exists(cov_file):
+        raise FileNotFoundError(f"Covariance matrix {cov_file} not found.")
+
+    print(f"\n🧮 Loading Correlated SNe Covariance: {cov_file}")
+    with open(cov_file, 'r') as f:
+        first_line = f.readline().strip()
+        C_dim = int(first_line)
+    
+    C_flat = np.loadtxt(cov_file, skiprows=1)
+    C_full = C_flat.reshape(C_dim, C_dim)
+    
+    # Extract the indices of the filtered SNe
+    sne_idx = sne['cov_idx'].values.astype(int)
+    
+    print(f"   Filtering {C_dim}x{C_dim} covariance matrix to match {len(sne_idx)} surviving SNe Ia...")
+    # Submatrix
+    C_sne = C_full[np.ix_(sne_idx, sne_idx)]
+    
+    # Add intrinsic scatter to the diagonal of the covariance matrix
+    # note: args.sigma_int_sne is used from CLI
+    if args.sigma_int_sne > 0:
+        print(f"   Adding SNe intrinsic scatter (σ_int = {args.sigma_int_sne}) to the covariance diagonal...")
+        np.fill_diagonal(C_sne, C_sne.diagonal() + args.sigma_int_sne**2)
+    
+    print(f"   Inverting SNe Covariance Matrix...")
+    C_inv_sne = np.linalg.inv(C_sne)
+    sign, ln_det_C_sne = np.linalg.slogdet(C_sne)
+    if sign <= 0:
+        raise ValueError("Determinant of the SNe covariance matrix is not positive.")
+    
+    print(f"   Covariance prepared successfully.")
+
 # ============================================================================
 # CHECK CAMB
 # ============================================================================
@@ -380,7 +451,7 @@ except ImportError:
 # ============================================================================
 
 H0_MIN, H0_MAX = 40, 100
-OMCH2_MIN, OMCH2_MAX = 0.01, 0.35
+OMCH2_MIN, OMCH2_MAX = 0.05, 0.35
 M_MIN, M_MAX = -3.0, 3.0
 GAMMA_MIN, GAMMA_MAX = -3.0, 3.0
 SIGMA_INT_MIN, SIGMA_INT_MAX = 0.0, 2.0
@@ -393,6 +464,64 @@ ZH_MIN, ZH_MAX = 0.01, 1e10    # Horizon scale (Kerr geometry, long-range)
 # Intrinsic scatter from CLI arguments (added in quadrature to observational errors)
 SIGMA_INT_SNE = args.sigma_int_sne   # ~0.1 mag typical for Pantheon+ without cov
 SIGMA_INT_QSO = args.sigma_int_qso   # User-specified, try 0.3-0.6 for robustness test
+
+
+
+GLOBAL_EVAL_MODE = False
+GLOBAL_EVAL_ARRAYS = {}
+
+def _neg2logL_mu(residuals, err_eff):
+    """Compute -2·ln L for distance-modulus residuals.
+
+    Dispatches Gaussian / Student-t / Cauchy based on global LIKELIHOOD_TYPE.
+    CC H(z) data is ALWAYS Gaussian (handled separately in chi2_* functions).
+    If C_inv_sne is loaded, SNe Ia are evaluated with the Correlated Gaussian
+    likelihood, bypassing the robust diagonal likelihoods for SNe points.
+    """
+    if GLOBAL_EVAL_MODE:
+        GLOBAL_EVAL_ARRAYS['residuals'] = residuals
+        GLOBAL_EVAL_ARRAYS['err_eff'] = err_eff
+        
+    neg2logL_total = 0.0
+    
+    # --- SPLIT RESIDUALS IF COVARIANCE IS ACTIVE ---
+    if C_inv_sne is not None:
+        if COMBINED_MODE:
+            res_sne = residuals[sne_mask]
+            res_qso = residuals[qso_mask]
+            err_qso = err_eff[qso_mask]
+        else:
+            res_sne = residuals
+            res_qso = np.array([])
+            err_qso = np.array([])
+            
+        # Correlated Gaussian for SNe: R^T * C^{-1} * R + ln|C|
+        # (Note: we add N_sne * ln(2π) if we want absolute likelihood, but for relative
+        #  delta-logL we just need R^T C^{-1} R + ln|C|. The diagonal Gaussian also omits 2π).
+        chi2_sne = res_sne.T @ C_inv_sne @ res_sne
+        neg2logL_total += chi2_sne + ln_det_C_sne
+    else:
+        # No covariance -> all points go to the diagonal evaluator
+        res_qso = residuals
+        err_qso = err_eff
+
+    # --- DIAGONAL LIKELIHOOD FOR REMAINING POINTS (QSOs, or all if no cov) ---
+    if len(res_qso) > 0:
+        if LIKELIHOOD_TYPE == 'student' or LIKELIHOOD_TYPE == 'cauchy':
+            nu = NU_DOF if LIKELIHOOD_TYPE == 'student' else 1.0
+            # -2 ln L_i = 2·ln(σ) + (ν+1)·ln(1 + r²/(ν·σ²))
+            r2 = res_qso**2
+            s2 = err_qso**2
+            diag_term = np.sum(2 * np.log(err_qso)
+                               + (nu + 1) * np.log1p(r2 / (nu * s2 + 1e-30)))
+            neg2logL_total += diag_term
+        else:
+            # Standard Gaussian: −2 ln L = Σ[(r/σ)² + ln(σ²)]
+            chi2_term = np.sum((res_qso / err_qso) ** 2)
+            norm_term = np.sum(np.log(err_qso**2))
+            neg2logL_total += chi2_term + norm_term
+
+    return neg2logL_total
 
 def compute_Omega_m(H0, omch2, ombh2=0.0224):
     """Compute Ωm from H0 and Ωch² + Ωbh²."""
@@ -465,9 +594,8 @@ def chi2_lcdm(params):
             mu_th = mu_th_base + delta_M
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
-        # -2·logL = χ² + normalization term (for proper comparison with varying σ_int)
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))  # log(σ²) penalty
+        # -2·logL (Gaussian, Student-t, or Cauchy depending on --student/--cauchy)
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
 
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -476,7 +604,7 @@ def chi2_lcdm(params):
             chi2_cc = 0
             norm_cc = 0
 
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -564,8 +692,7 @@ def chi2_gcdm(params):
             mu_th = mu_th_base + delta_M + gamma_corr
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
 
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -574,7 +701,7 @@ def chi2_gcdm(params):
             chi2_cc = 0
             norm_cc = 0
 
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -600,14 +727,13 @@ def chi2_lcdm_no_M(params):
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
             norm_cc = np.sum(np.log(err_cc**2))
         else:
             chi2_cc, norm_cc = 0, 0
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -647,8 +773,7 @@ def chi2_gcdm_no_M(params):
         else:
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
 
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -656,7 +781,7 @@ def chi2_gcdm_no_M(params):
         else:
             chi2_cc, norm_cc = 0, 0
 
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -677,12 +802,12 @@ def chi2_gcdm_linear(params):
             H0 = 67.4
         else:
             H0, omch2, M_sne, M_qso, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX):
-                return 1e10
-            if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-                return 1e10
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+            
+        if not args.no_nuisance:
+            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
     else:
         if args.fixed_anchor:
             if args.no_nuisance:
@@ -693,12 +818,12 @@ def chi2_gcdm_linear(params):
             H0 = 67.4
         else:
             H0, omch2, delta_M, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < delta_M < M_MAX):
-                return 1e10
-            if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-                return 1e10
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+            
+        if not args.no_nuisance:
+            if not (M_MIN < delta_M < M_MAX): return 1e10
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
 
     if not check_physical_prior(H0, omch2):
         return 1e10
@@ -721,8 +846,7 @@ def chi2_gcdm_linear(params):
             mu_th = mu_th_base + delta_M + gamma_corr
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
 
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -730,7 +854,7 @@ def chi2_gcdm_linear(params):
         else:
             chi2_cc, norm_cc = 0, 0
 
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -747,12 +871,12 @@ def chi2_gcdm_log_squared(params):
             H0 = 67.4
         else:
             H0, omch2, M_sne, M_qso, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX):
-                return 1e10
-            if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-                return 1e10
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+            
+        if not args.no_nuisance:
+            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
     else:
         if args.fixed_anchor:
             if args.no_nuisance:
@@ -763,12 +887,12 @@ def chi2_gcdm_log_squared(params):
             H0 = 67.4
         else:
             H0, omch2, delta_M, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < delta_M < M_MAX):
-                return 1e10
-            if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-                return 1e10
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+            
+        if not args.no_nuisance:
+            if not (M_MIN < delta_M < M_MAX): return 1e10
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
 
     if not check_physical_prior(H0, omch2):
         return 1e10
@@ -791,8 +915,7 @@ def chi2_gcdm_log_squared(params):
             mu_th = mu_th_base + delta_M + gamma_corr
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
 
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -800,7 +923,7 @@ def chi2_gcdm_log_squared(params):
         else:
             chi2_cc, norm_cc = 0, 0
 
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -817,12 +940,12 @@ def chi2_gcdm_log_cubed(params):
             H0 = 67.4
         else:
             H0, omch2, M_sne, M_qso, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX):
-                return 1e10
-            if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-                return 1e10
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+            
+        if not args.no_nuisance:
+            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
     else:
         if args.fixed_anchor:
             if args.no_nuisance:
@@ -833,12 +956,12 @@ def chi2_gcdm_log_cubed(params):
             H0 = 67.4
         else:
             H0, omch2, delta_M, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < delta_M < M_MAX):
-                return 1e10
-            if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-                return 1e10
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+            
+        if not args.no_nuisance:
+            if not (M_MIN < delta_M < M_MAX): return 1e10
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
 
     if not check_physical_prior(H0, omch2):
         return 1e10
@@ -861,8 +984,7 @@ def chi2_gcdm_log_cubed(params):
             mu_th = mu_th_base + delta_M + gamma_corr
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
 
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -870,7 +992,7 @@ def chi2_gcdm_log_cubed(params):
         else:
             chi2_cc, norm_cc = 0, 0
 
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -907,8 +1029,7 @@ def chi2_gcdm_linear_no_M(params):
         else:
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
         
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -916,7 +1037,7 @@ def chi2_gcdm_linear_no_M(params):
         else:
             chi2_cc, norm_cc = 0, 0
             
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -950,8 +1071,7 @@ def chi2_gcdm_log_squared_no_M(params):
         else:
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
         
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -959,7 +1079,7 @@ def chi2_gcdm_log_squared_no_M(params):
         else:
             chi2_cc, norm_cc = 0, 0
             
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -992,8 +1112,7 @@ def chi2_gcdm_log_cubed_no_M(params):
         else:
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
         
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -1001,7 +1120,7 @@ def chi2_gcdm_log_cubed_no_M(params):
         else:
             chi2_cc, norm_cc = 0, 0
             
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -1085,10 +1204,9 @@ def chi2_decay(params):
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
             mu_th = mu_th_base + delta_M + decay_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
 
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -1096,7 +1214,7 @@ def chi2_decay(params):
         else:
             chi2_cc, norm_cc = 0, 0
 
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -1141,8 +1259,7 @@ def chi2_decay_no_M(params):
         else:
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
         
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -1150,7 +1267,7 @@ def chi2_decay_no_M(params):
         else:
             chi2_cc, norm_cc = 0, 0
             
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -1235,10 +1352,9 @@ def chi2_gcdm_log_decay(params):
             err_eff = np.sqrt(err_mu**2 + sigma_int**2)
         else:
             mu_th = mu_th_base + delta_M + unified_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SNE**2)
+            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
 
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -1246,7 +1362,7 @@ def chi2_gcdm_log_decay(params):
         else:
             chi2_cc, norm_cc = 0, 0
 
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -1297,8 +1413,7 @@ def chi2_gcdm_log_decay_no_M(params):
         else:
             err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
             
-        chi2_term = np.sum(((mu_obs - mu_th) / err_eff) ** 2)
-        norm_term = np.sum(np.log(err_eff**2))
+        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
         
         if len(z_cc) > 0:
             chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
@@ -1306,7 +1421,7 @@ def chi2_gcdm_log_decay_no_M(params):
         else:
             chi2_cc, norm_cc = 0, 0
             
-        return chi2_term + norm_term + chi2_cc + norm_cc
+        return neg2logL_mu + chi2_cc + norm_cc
     except Exception:
         return 1e10
 
@@ -1471,12 +1586,12 @@ for model in models_to_fit:
             if res.fun < best_chi2:
                 best_chi2 = res.fun
                 best_params = res.x
-                # print(f"      Start {i+1}: χ² = {res.fun:.1f}") # Optional verbosity
+                # print(f"      Start {i+1}: -2lnL = {res.fun:.1f}") # Optional verbosity
         except:
             pass
             
     if best_params is not None:
-        print(f"      ✅ Best χ² = {best_chi2:.1f}")
+        print(f"      ✅ Best -2lnL = {best_chi2:.1f}")
         
         # Unpack parameters based on mode
         # Unpack parameters based on mode
@@ -1707,7 +1822,7 @@ else:
 # RESULTS TABLE
 # ============================================================================
 print("\n" + "=" * 105)
-print(f"{'Modelo':<24} {'H₀':>8} {'Ωₘ':>8} {'δM':>10} {'γ₀':>10} {'χ²':>10} {'BIC':>10} {'AIC':>10} {'ΔBIC':>8} {'ΔAIC':>8}")
+print(f"{'Modelo':<24} {'H₀':>8} {'Ωₘ':>8} {'δM':>10} {'γ₀':>10} {'-2lnL':>10} {'BIC':>10} {'AIC':>10} {'ΔBIC':>8} {'ΔAIC':>8}")
 print("─" * 115)
 
 for res in results:
@@ -1886,6 +2001,113 @@ else:
     H0_n = 67.4
     Om_n = 0.3
     M_n = 0.0
+
+
+# ============================================================================
+# REDSHIFT BIN ANALYSIS (ΛCDM vs Best Model)
+# ============================================================================
+if best_overall_model and lcdm_res and best_overall_model["name"] != "ΛCDM":
+    print("\n" + "=" * 80)
+    print("📈 REDSHIFT BIN ANALYSIS (-2lnL Improvements)")
+    print("=" * 80)
+    
+    # Define bins
+    bins = [
+        (0.0, 0.5, "Local (z < 0.5)"),
+        (0.5, 1.0, "Intermediate (0.5 < z < 1.0)"),
+        (1.0, 2.0, "High SNe + Low QSO (1.0 < z < 2.0)"),
+        (2.0, 8.0, "Deep QSO (z > 2.0)")
+    ]
+    
+    def get_model_residuals(model_res):
+        global GLOBAL_EVAL_MODE
+        GLOBAL_EVAL_MODE = True
+        
+        # Match the function based on name
+        name = model_res["name"]
+        params = model_res["params"]
+        
+        # We need the chi2 function matching the name:
+        func = next((m["fn"] for m in models_to_fit if m["name"] == name), None)
+        if func:
+            try:
+                # Call it, ignoring result, just to trigger _neg2logL_mu
+                func(params)
+                res = GLOBAL_EVAL_ARRAYS['residuals'].copy()
+                err = GLOBAL_EVAL_ARRAYS['err_eff'].copy()
+                GLOBAL_EVAL_MODE = False
+                return res, err
+            except Exception:
+                GLOBAL_EVAL_MODE = False
+                return None, None
+        GLOBAL_EVAL_MODE = False
+        return None, None
+
+    res_lcdm_arr, err_lcdm_arr = get_model_residuals(lcdm_res)
+    res_best_arr, err_best_arr = get_model_residuals(best_overall_model)
+    
+    # Get CC residuals (evaluate chi2 functions separately or just use mu array info)
+    # Actually, CC H(z) data is not binned here. We just bin mu_obs.
+    
+    if res_lcdm_arr is not None and res_best_arr is not None:
+        print(f"   Modelo Base: ΛCDM")
+        print(f"   Modelo Win:  {best_overall_model['name']}\n")
+        print(f"   {'Redshift Bin':<35} {'N pts':<8} {'Δ(-2lnL)':>10}")
+        print("   " + "─" * 53)
+
+        def _bin_neg2logL(res_bin, err_bin, sne_bin_mask):
+            """Per-bin -2lnL using covariance for SNe when available.
+
+            For binned evaluation we cannot use the full C_inv (wrong shape),
+            so we fall back to diagonal errors for SNe within the bin.  The
+            bin analysis is only diagnostic — absolute -2lnL values are not
+            used for model selection, only deltas between models evaluated
+            with the SAME approximation.
+            """
+            neg2ll = 0.0
+            if C_inv_sne is not None and sne_bin_mask is not None and np.any(sne_bin_mask):
+                res_sne_b = res_bin[sne_bin_mask]
+                err_sne_b = err_bin[sne_bin_mask]
+                res_qso_b = res_bin[~sne_bin_mask]
+                err_qso_b = err_bin[~sne_bin_mask]
+                neg2ll += np.sum((res_sne_b / err_sne_b)**2) + np.sum(np.log(err_sne_b**2))
+            else:
+                res_qso_b = res_bin
+                err_qso_b = err_bin
+
+            if len(res_qso_b) > 0:
+                if LIKELIHOOD_TYPE == 'student' or LIKELIHOOD_TYPE == 'cauchy':
+                    nu = NU_DOF if LIKELIHOOD_TYPE == 'student' else 1.0
+                    r2 = res_qso_b**2
+                    s2 = err_qso_b**2
+                    neg2ll += np.sum(2 * np.log(err_qso_b)
+                                     + (nu + 1) * np.log1p(r2 / (nu * s2 + 1e-30)))
+                else:
+                    neg2ll += np.sum((res_qso_b / err_qso_b)**2) + np.sum(np.log(err_qso_b**2))
+            return neg2ll
+
+        total_delta = 0
+        
+        for zmin, zmax, label in bins:
+            mask = (z_mu >= zmin) & (z_mu < zmax)
+            n_pts = np.sum(mask)
+            if n_pts == 0:
+                continue
+
+            sne_bin = sne_mask[mask] if sne_mask is not None else None
+            n2ll_lcdm_bin = _bin_neg2logL(res_lcdm_arr[mask], err_lcdm_arr[mask], sne_bin)
+            n2ll_best_bin = _bin_neg2logL(res_best_arr[mask], err_best_arr[mask], sne_bin)
+            
+            delta_n2ll = n2ll_best_bin - n2ll_lcdm_bin
+            total_delta += delta_n2ll
+            
+            print(f"   {label:<35} {n_pts:<8d} {delta_n2ll:>10.1f}")
+            
+        print("   " + "─" * 53)
+        print(f"   {'TOTAL (Distances Only) *':<35} {'':<8} {total_delta:>10.1f}")
+        print("   * Excludes CC data penalties/improvements.")
+    else:
+        print("   ⚠️ Could not evaluate bin residuals.")
 
 
 
@@ -2088,9 +2310,13 @@ if args.mcmc or args.nested:
                 sne_mask=sne_mask, combined_mode=COMBINED_MODE,
                 sigma_int_sne=SIGMA_INT_SNE, sigma_int_qso=SIGMA_INT_QSO,
                 no_nuisance=args.no_nuisance, asymmetric=args.asymmetric,
-                sanity_check=args.sanity_check
+                sanity_check=args.sanity_check,
+                likelihood_type=LIKELIHOOD_TYPE,
+                nu=NU_DOF if NU_DOF is not None else 5.0,
+                C_inv_sne=C_inv_sne, ln_det_C_sne=ln_det_C_sne
             )
-        print("   ✅ Shared likelihoods loaded from gammacdm_likelihoods.py")
+        cov_label = f" (with {args.cov} covariance)" if C_inv_sne is not None else ""
+        print(f"   ✅ Shared likelihoods loaded from gammacdm_likelihoods.py{cov_label}")
 
         if args.nested:
             # ==================================================================
@@ -2141,6 +2367,15 @@ if args.mcmc or args.nested:
 
             if args.no_nuisance:
                 common_args.append("--no-nuisance")
+            
+            if args.student:
+                common_args.append("--student")
+                common_args.extend(["--nu", str(args.nu)])
+            elif args.cauchy:
+                common_args.append("--cauchy")
+
+            if args.cov != 'none':
+                common_args.extend(["--cov", args.cov])
             
             # ==================================================================
             # PARALLEL EXECUTION (Robust)
@@ -2477,12 +2712,7 @@ if args.mcmc or args.nested:
                 # We leave omch2 and M free here, and constrain them per-model below.
 
 
-            def _get_M(samples, mode):
-                if mode:
-                    ms = np.mean(samples["M_sne"])
-                    mq = np.mean(samples["M_qso"])
-                    return (ms + mq) / 2, np.sqrt(np.std(samples["M_sne"])**2 + np.std(samples["M_qso"])**2) / 2
-                return np.mean(samples["mabs"]), np.std(samples["mabs"])
+
 
             # MCMC sampler configuration
             sampler_cfg = {
