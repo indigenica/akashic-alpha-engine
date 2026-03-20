@@ -82,7 +82,7 @@ To ensure the statistical validity of the results, a validation suite is provide
 *   `gammacdm_likelihoods.py`: Shared likelihoods.
 *   `run_nested_single.py`: Runner for isolated Nested Sampling processes (requires PolyChord).
 *   `full_dataset.csv`: The curated dataset (SNe Ia + Quasars + Cosmic Chronometers).
-*   `Pantheon+SH0ES_STATONLY.cov & Pantheon+SH0ES_STAT+SYS.cov`:  Covariance matrices are provided in [PantheonPlusSH0ES/DataRelease](https://github.com/PantheonPlusSH0ES/DataRelease/tree/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR)
+*   `Pantheon+SH0ES_STATONLY.cov & Pantheon+SH0ES_STAT+SYS.cov`:  Covariance matrices are provided in [PantheonPlusSH0ES/DataRelease](https://github.com/PantheonPlusSH0ES/DataRelease/tree/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR).
 ---
 
 ## Scope and Interpretation
