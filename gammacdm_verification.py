@@ -451,7 +451,7 @@ except ImportError:
 # ============================================================================
 
 H0_MIN, H0_MAX = 40, 100
-OMCH2_MIN, OMCH2_MAX = 0.05, 0.35
+OMCH2_MIN, OMCH2_MAX = 0.01, 0.35
 M_MIN, M_MAX = -3.0, 3.0
 GAMMA_MIN, GAMMA_MAX = -3.0, 3.0
 SIGMA_INT_MIN, SIGMA_INT_MAX = 0.0, 2.0
