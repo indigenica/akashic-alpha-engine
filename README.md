@@ -94,12 +94,20 @@ The reproduction package does not implement the full official likelihood pipelin
 
 ## Usage
 
-### Canonical Reproduction (LOG²-Decay — Preprint values)
+### Canonical Reproduction and Mock Test (LOG²-Decay — Preprint values)
 ```bash
 pip install camb pandas numpy scipy matplotlib cobaya
 
 python gammacdm_verification.py \
     --revised --legacy --fixed-anchor --mock --nested
+```
+
+### Fast High-Precision Reproduction and BAO Null Test
+```bash
+pip install camb pandas numpy scipy matplotlib cobaya
+
+python gammacdm_verification.py \
+    --revised --fixed-anchor --camb-tab --penalty-m --bao-null
 ```
 
 ### Original Preprint (Gen I)
