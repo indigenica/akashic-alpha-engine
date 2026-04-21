@@ -43,8 +43,8 @@ $$\Delta\mu(z) = A \cdot e^{-z/z_b} + \gamma_0 \cdot [\ln(1+z)]^2 \cdot e^{-z/z_
 | III | **LOG²-Decay** | **7** | **SNe+QSO+CC** | **−760** | **−785** | **Full alleviation** |
 
 <p align="center">
-  <img width="48%" alt="mcmc_log_decay_full_corner" src="https://github.com/user-attachments/assets/0f4a2469-79e4-4ddd-9652-361313c0d1f1" />
-  <img width="48%" alt="nested_log_decay_full_corner" src="https://github.com/user-attachments/assets/3efeb680-8d23-4abe-927e-a7a9a0de0d67" />
+  <img width="48%" alt="mcmc_log_decay_full_corner" src="https://github.com/user-attachments/assets/7bbabd0d-0300-46fb-86aa-eced82b5ecbf" />
+  <img width="48%" alt="nested_log_decay_full_corner" src="https://github.com/user-attachments/assets/50f6dded-8a6d-4b89-90f3-ce2f106ffeef" />
 </p>
 
 <p align="center">
