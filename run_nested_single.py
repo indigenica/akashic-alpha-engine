@@ -4,7 +4,7 @@ Single-model nested sampling runner - runs ONE PolyChord model per process.
 Avoids MPI_FINALIZE issue by running in isolated process.
 
 Usage:
-    python run_nested_single.py <model> --nlive 100 --sigma-int-sne 0.1 --sigma-int-qso 0.4 --qso-err-cut 10.0
+    python run_nested_single.py <model> --nlive 100 --sigma-int-sne 0.1 --sigma-int-qso 0.4 --qso-err-cut 1.5
     
     model: lcdm, log2
 """
@@ -15,6 +15,12 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
+# Shared physical constants and H0_local helper (single source of truth).
+from cosmo_constants import (
+    SH0ES_Z_PIVOT, Z_PIVOT,
+)
+from gammacdm_core import h0_local
+
 # Parse arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("model", choices=["lcdm", "log2", "decay", "log_decay"])
@@ -23,7 +29,8 @@ parser.add_argument("--sigma-int-sne", type=float, default=0.1, dest="sigma_int_
 parser.add_argument("--sigma-int-qso", type=float, default=0.4, dest="sigma_int_qso")
 parser.add_argument("--qso-err-cut", type=float, default=1.5, dest="qso_err_cut")
 parser.add_argument("--sne-err-cut", type=float, default=0.5, dest="sne_err_cut")
-parser.add_argument("--z-min", type=float, default=0.01, dest="z_min")
+parser.add_argument("--z-min-sne", type=float, default=0.01, dest="z_min_sne")
+parser.add_argument("--z-min-qso", type=float, default=0.0, dest="z_min_qso")
 parser.add_argument("--revised", action="store_true", help="Use full_dataset_revisado.csv instead of full_dataset.csv")
 parser.add_argument("--output-dir", type=str, default="chains", dest="output_dir")
 parser.add_argument("--no-nuisance", action="store_true", help="Fix calibration offsets (M_sne, M_qso) to 0")
@@ -37,6 +44,10 @@ parser.add_argument("--cauchy", action="store_true", help="Use Cauchy likelihood
 parser.add_argument("--nu", type=float, default=5.0, help="Degrees of freedom for Student-t (default: 5.0)")
 parser.add_argument("--cov", type=str, default="none", choices=["none", "stat", "sys"],
                     help="Covariance matrix type for SNe Ia (default: 'none')")
+parser.add_argument("--cmb", action="store_true",
+                    help="Add CMB shift parameter prior (Planck 2018)")
+parser.add_argument("--fit-scatter", action="store_true", dest="fit_scatter",
+                    help="Fit intrinsic scatter σ_int,SNe and σ_int,QSO as free parameters")
 args = parser.parse_args()
 
 print(f"=" * 70)
@@ -83,19 +94,22 @@ else:
     df = pd.read_csv('https://raw.githubusercontent.com/indigenica/akashic-alpha-engine/main/' + dataset_name)
 
 # Filter and extract exactly as in gammacdm_verification.py
-sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min)]
+sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min_sne)]
 cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
 
 if args.no_quasars:
     qso = pd.DataFrame(columns=df.columns)
     mu_data = sne.copy()
+    COMBINED_MODE = False
 elif getattr(args, 'quasars_only', False):
     sne = pd.DataFrame(columns=df.columns)
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min_qso)]
     mu_data = qso.copy()
+    COMBINED_MODE = False
 else:
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min_qso)]
     mu_data = pd.concat([sne, qso])
+    COMBINED_MODE = True
 
 n_sne = len(sne)
 n_qso = len(qso)
@@ -127,6 +141,8 @@ print(f"📊 Total points N = {N}")
 # ============================================================================
 C_inv_sne = None
 ln_det_C_sne = None
+_cov_evals_nested = None
+_cov_evecs_nested = None
 
 if args.cov != 'none' and n_sne > 0:
     cov_file = "Pantheon+SH0ES_STATONLY.cov" if args.cov == 'stat' else "Pantheon+SH0ES_STAT+SYS.cov"
@@ -141,11 +157,19 @@ if args.cov != 'none' and n_sne > 0:
 
         sne_all = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu')].copy()
         sne_all['cov_idx'] = np.arange(len(sne_all))
-        sne_filt = sne_all[(sne_all['err'] < args.sne_err_cut) & (sne_all['z'] > args.z_min)]
+        sne_filt = sne_all[(sne_all['err'] < args.sne_err_cut) & (sne_all['z'] > args.z_min_sne)]
         sne_idx = sne_filt['cov_idx'].values.astype(int)
 
         C_sne = C_full[np.ix_(sne_idx, sne_idx)]
-        if args.sigma_int_sne > 0:
+
+        _cov_evals_nested = None
+        _cov_evecs_nested = None
+        if args.fit_scatter:
+            print(f"   Eigendecomposing base covariance for σ_int fitting...")
+            _cov_evals_nested, _cov_evecs_nested = np.linalg.eigh(C_sne)
+            _cov_evals_nested = np.maximum(_cov_evals_nested, 1e-15)
+
+        if not args.fit_scatter and args.sigma_int_sne > 0:
             np.fill_diagonal(C_sne, C_sne.diagonal() + args.sigma_int_sne**2)
 
         C_inv_sne = np.linalg.inv(C_sne)
@@ -162,16 +186,21 @@ if args.cov != 'none' and n_sne > 0:
 from cobaya.run import run
 from gammacdm_likelihoods import create_likelihoods
 
+_cov_ev = _cov_evals_nested
+_cov_ec = _cov_evecs_nested
+
 LCDMLikelihood, GammaCDM_LOG2_Likelihood, DecayLikelihood, LogDecayLikelihood = \
     create_likelihoods(
         z_mu=z_mu, mu_obs=mu_obs, err_mu=err_mu,
         z_cc=z_cc, H_obs=H_obs, err_cc=err_cc,
-        sne_mask=sne_mask, combined_mode=True,
+        sne_mask=sne_mask, combined_mode=COMBINED_MODE,
         sigma_int_sne=SIGMA_INT_SNE, sigma_int_qso=SIGMA_INT_QSO,
         no_nuisance=args.no_nuisance, asymmetric=args.asymmetric,
         sanity_check=args.sanity_check,
         likelihood_type=_lk_type, nu=_nu_val,
-        C_inv_sne=C_inv_sne, ln_det_C_sne=ln_det_C_sne
+        C_inv_sne=C_inv_sne, ln_det_C_sne=ln_det_C_sne,
+        use_cmb=args.cmb, fit_scatter=args.fit_scatter,
+        cov_evals=_cov_ev, cov_evecs=_cov_ec
     )
 # Alias for backward compat with model selection below
 LOG2Likelihood = GammaCDM_LOG2_Likelihood
@@ -184,21 +213,40 @@ print("   ✅ Shared likelihoods loaded from gammacdm_likelihoods.py")
 # ============================================================================
 base_params = {
     "H0": {"prior": {"min": 40, "max": 100}, "ref": 70, "proposal": 2.0},
-    "omch2": {"prior": {"min": 0.05, "max": 0.35}, "ref": 0.12, "proposal": 0.02},
-    "M_sne": {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05},
-    "M_qso": {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05},
+    "omch2": {"prior": {"min": 0.01, "max": 0.35}, "ref": 0.12, "proposal": 0.02},
     "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06
 }
+# Gaussian calibration priors (externally justified):
+#   M_sne ~ N(0, 0.05): Pantheon+ residual calibration uncertainty ~0.02-0.04 mag
+#   M_qso ~ N(0, 0.15): Lusso+20 L_X-L_UV intercept uncertainty ~0.1-0.2 mag
+# Same priors applied to ALL models for fair Bayesian comparison.
+if COMBINED_MODE:
+    base_params["M_sne"] = {"prior": {"dist": "norm", "loc": 0, "scale": 0.05}, "ref": 0.0, "proposal": 0.02}
+    base_params["M_qso"] = {"prior": {"dist": "norm", "loc": 0, "scale": 0.15}, "ref": 0.0, "proposal": 0.05}
+else:
+    base_params["mabs"] = {"prior": {"dist": "norm", "loc": 0, "scale": 0.05}, "ref": 0.0, "proposal": 0.02}
+if args.fit_scatter:
+    if COMBINED_MODE:
+        base_params["sigma_int_sne"] = {"prior": {"min": 0.001, "max": 0.5}, "ref": 0.1, "proposal": 0.01}
+        base_params["sigma_int_qso"] = {"prior": {"min": 0.1, "max": 3.0}, "ref": 0.5, "proposal": 0.1}
+    elif getattr(args, 'quasars_only', False):
+        base_params["sigma_int_qso"] = {"prior": {"min": 0.1, "max": 3.0}, "ref": 0.5, "proposal": 0.1}
+    else:
+        base_params["sigma_int_sne"] = {"prior": {"min": 0.001, "max": 0.5}, "ref": 0.1, "proposal": 0.01}
+
 defaultH0 = {"prior": {"min": 40, "max": 100}, "ref": 70, "proposal": 2.0}
 defaultGammaLog2 = {"prior": {"min": -3.0, "max": 3.0}, "ref": -0.8, "proposal": 0.05}
-defaultA = {"prior": {"min": -3.0, "max": 3.0}, "ref": -0.175, "proposal": 0.05}
+defaultA = {"prior": {"min": -2.0, "max": 2.0}, "ref": -0.175, "proposal": 0.1}
 defaultZd = {"prior": {"min": 0.01, "max": 10.0}, "ref": 3.5, "proposal": 0.1}
-# NOTE: For nested sampling, we use MLE-informed priors to prevent degeneracies.
-# MLE uses wider priors ([-3,3], ZH=1e10) to find unconstrained optimum.
-defaultA_unified = {"prior": {"min": -1.0, "max": 1.0}, "ref": -0.175, "proposal": 0.05}
+# Conservative priors: wider model-specific ranges make the Bayes factor more
+# conservative (more prior volume to penalise).  Gaussian δM (in base_params)
+# breaks the A↔δM degeneracy via external calibration info, not data dredging.
+defaultA_unified = {"prior": {"min": -2.0, "max": 2.0}, "ref": -0.175, "proposal": 0.1}
 defaultZb = {"prior": {"min": 0.01, "max": 5.0}, "ref": 0.4, "proposal": 0.1}
-defaultGammaLogDecay = {"prior": {"min": -2.0, "max": 0.0}, "ref": -0.8, "proposal": 0.05}
-defaultZh = {"prior": {"min": 0.01, "max": 100.0}, "ref": 42.0, "proposal": 5.0}
+defaultGammaLogDecay = {"prior": {"min": -3.0, "max": 1.0}, "ref": -0.8, "proposal": 0.1}
+# z_h is a scale parameter spanning orders of magnitude → sample log10(z_h)
+# uniformly (log-uniform on z_h ∈ [1, 200]).
+defaultLogZh = {"prior": {"min": 0.0, "max": 2.301}, "ref": 1.62, "proposal": 0.15}
 
 # Apply constraints to base_params (ΛCDM always keeps M free)
 if args.fixed_anchor:
@@ -211,9 +259,7 @@ elif args.sanity_check:
     # ΛCDM fixes omch2, keeps M free (handled in model block)
     # γCDM/Decay keeps omch2 free, removes M (handled in model block)
 else:
-    if args.no_quasars:
-        print("   🔒 No quasars: M_qso fixed to 0")
-        base_params["M_qso"] = 0.0
+    pass
     # --no-nuisance / --asymmetric applied PER MODEL below (ΛCDM keeps M free)
 
 
@@ -236,12 +282,18 @@ elif args.model == "log2":
     # FOR γCDM models, these flags SHOULD work even with fixed-anchor
     if args.asymmetric or args.sanity_check:
         print("   ✂️  Asymmetric/Sanity: M REMOVED from γCDM-LOG²")
-        params["M_sne"] = 0.0
-        params["M_qso"] = 0.0
+        if COMBINED_MODE:
+            params["M_sne"] = 0.0
+            params["M_qso"] = 0.0
+        else:
+            params["mabs"] = 0.0
     elif args.no_nuisance:
         print("   🔒 No-nuisance: M FIXED to 0 for γCDM-LOG²")
-        params["M_sne"] = 0.0
-        params["M_qso"] = 0.0
+        if COMBINED_MODE:
+            params["M_sne"] = 0.0
+            params["M_qso"] = 0.0
+        else:
+            params["mabs"] = 0.0
     output_prefix = os.path.join(args.output_dir, "nested_log2")
 elif args.model == "decay":
     LikelihoodClass = DecayLikelihood
@@ -254,12 +306,18 @@ elif args.model == "decay":
     # Apply --no-nuisance (fix M=0) or --asymmetric (remove M)
     if args.asymmetric or args.sanity_check:
         print("   ✂️  Asymmetric/Sanity: M REMOVED from Decay model")
-        params["M_sne"] = 0.0
-        params["M_qso"] = 0.0
+        if COMBINED_MODE:
+            params["M_sne"] = 0.0
+            params["M_qso"] = 0.0
+        else:
+            params["mabs"] = 0.0
     elif args.no_nuisance:
         print("   🔒 No-nuisance: M FIXED to 0 for Decay model")
-        params["M_sne"] = 0.0
-        params["M_qso"] = 0.0
+        if COMBINED_MODE:
+            params["M_sne"] = 0.0
+            params["M_qso"] = 0.0
+        else:
+            params["mabs"] = 0.0
     output_prefix = os.path.join(args.output_dir, "nested_decay")
 elif args.model == "log_decay":
     LikelihoodClass = LogDecayLikelihood
@@ -267,31 +325,37 @@ elif args.model == "log_decay":
     params["A"] = defaultA_unified
     params["zb"] = defaultZb
     params["gamma_log_decay"] = defaultGammaLogDecay
-    params["zh"] = defaultZh
-    # Tighten δM priors for LOG²-Decay to break A↔δM degeneracy
-    if isinstance(params.get("M_sne"), dict):
-        params["M_sne"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
-        params["M_qso"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
+    params["log_zh"] = defaultLogZh
+    params["zh"] = {"value": "lambda log_zh: 10**log_zh", "latex": r"z_h"}
     if not args.fixed_anchor and not args.sanity_check:
         params["H0"] = defaultH0
     if args.asymmetric or args.sanity_check:
         print("   ✂️  Asymmetric/Sanity: M REMOVED from γCDM-LOG²-DECAY")
-        params["M_sne"] = 0.0
-        params["M_qso"] = 0.0
+        if COMBINED_MODE:
+            params["M_sne"] = 0.0
+            params["M_qso"] = 0.0
+        else:
+            params["mabs"] = 0.0
     elif args.no_nuisance:
         print("   🔒 No-nuisance: M FIXED to 0 for γCDM-LOG²-DECAY")
-        params["M_sne"] = 0.0
-        params["M_qso"] = 0.0
+        if COMBINED_MODE:
+            params["M_sne"] = 0.0
+            params["M_qso"] = 0.0
+        else:
+            params["mabs"] = 0.0
     output_prefix = os.path.join(args.output_dir, "nested_log_decay")
 
+# num_repeats = 5 * ndims (Handley+2015 recommendation for proper decorrelation)
+ndims = sum(1 for v in params.values() if isinstance(v, dict) and "prior" in v)
 sampler_cfg = {
     "polychord": {
         "nlive": args.nlive,
-        "num_repeats": 2 * 5,
+        "num_repeats": max(10, 5 * ndims),
         "precision_criterion": 0.01,
         "boost_posterior": 5.0
     }
 }
+print(f"   PolyChord config: nlive={args.nlive}, num_repeats={max(10, 5*ndims)} (ndims={ndims})")
 
 info = {
     "likelihood": {"model": LikelihoodClass},
@@ -351,8 +415,14 @@ def _get_val(key, default=0.0):
         pass
     return default
 
-M_sne_mean = _get_val("M_sne")
-M_qso_mean = _get_val("M_qso")
+if COMBINED_MODE:
+    M_sne_mean = _get_val("M_sne")
+    M_qso_mean = _get_val("M_qso")
+    delta_M_mean = (M_sne_mean + M_qso_mean) / 2
+else:
+    M_sne_mean = _get_val("mabs") if getattr(args, 'no_quasars', False) else 0.0
+    M_qso_mean = _get_val("mabs") if getattr(args, 'quasars_only', False) else 0.0
+    delta_M_mean = _get_val("mabs")
 
 results = {
     "model": args.model,
@@ -363,7 +433,7 @@ results = {
     "omch2_std": float(np.std(samples["omch2"])),
     "M_sne_mean": M_sne_mean,
     "M_qso_mean": M_qso_mean,
-    "deltaM_mean": (M_sne_mean + M_qso_mean) / 2,
+    "deltaM_mean": delta_M_mean,
     "ombh2": 0.0224  # Fixed parameter
 }
 
@@ -382,8 +452,13 @@ elif args.model == "log_decay":
     results["zb_std"] = float(np.std(samples["zb"]))
     results["gamma_log_decay_mean"] = float(np.mean(samples["gamma_log_decay"]))
     results["gamma_log_decay_std"] = float(np.std(samples["gamma_log_decay"]))
-    results["zh_mean"] = float(np.mean(samples["zh"]))
-    results["zh_std"] = float(np.std(samples["zh"]))
+    # zh is derived from log_zh; reconstruct if not directly available
+    if "zh" in (samples.columns if hasattr(samples, 'columns') else samples):
+        zh_arr = np.array(samples["zh"])
+    else:
+        zh_arr = 10**np.array(samples["log_zh"])
+    results["zh_mean"] = float(np.mean(zh_arr))
+    results["zh_std"] = float(np.std(zh_arr))
 
 
 # Save results
@@ -422,8 +497,8 @@ elif args.model == "decay":
     zd_err = results['zd_std']
     print(f"   A     = {a_val:.3f} ± {a_err:.3f}")
     print(f"   zd    = {zd_val:.3f} ± {zd_err:.3f}")
-    # Local H0
-    h0_loc = H0_mean * 10**(-a_val/5)
+    # Local H0 (strict z→0 limit; pass z_pivot=SH0ES_Z_PIVOT for rigorous SH0ES match)
+    h0_loc = h0_local(H0_mean, A=a_val, z_b=zd_val, z_pivot=Z_PIVOT)
     print(f"   → H₀(local) implied: {h0_loc:.2f} km/s/Mpc")
 elif args.model == "log_decay":
     a_val = results['A_mean']
@@ -443,8 +518,9 @@ elif args.model == "log_decay":
     alpha = beta / 2
     spin = np.sqrt(1 - ((1 - alpha) / (1 + alpha))**2) if alpha < 1 else 1.0
     print(f"   🌀 Spin Implied: a/M = {spin:.4f}")
-    # Local H0 from bubble component
-    h0_loc = H0_mean * 10**(-a_val/5)
+    # Local H0 from bubble component (strict z→0 limit)
+    h0_loc = h0_local(H0_mean, A=a_val, z_b=zb_val,
+                      gamma_0=g_val, z_h=zh_val, z_pivot=Z_PIVOT)
     print(f"   → H₀(local) implied: {h0_loc:.2f} km/s/Mpc (Bubble A={a_val:.3f})")
 
 # 4. Nuisance Parameters (M)

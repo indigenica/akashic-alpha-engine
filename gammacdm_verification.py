@@ -24,14 +24,68 @@ Author: Bautista, 2026
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
+from scipy.optimize import minimize, differential_evolution, dual_annealing
+from scipy.interpolate import RegularGridInterpolator
 import warnings
 import argparse
 import os
 import sys
+import datetime
 from getdist import loadMCSamples
 
+# Shared numerical utilities and physical constants.
+# Any change to these must be done in the respective modules (single source of
+# truth) rather than by redefining locally.
+from cosmo_constants import (
+    C_LIGHT_KMS, Z_STAR, R_PLANCK, SIGMA_R_PLANCK, SIGMA_CORR_CMB,
+    SH0ES_H0, SH0ES_SIG, SH0ES_Z_PIVOT, Z_PIVOT,
+    OMBH2_FIDUCIAL, PLANCK_H0, PLANCK_OMCH2,
+    H0_MIN, H0_MAX, OMCH2_MIN, OMCH2_MAX, M_MIN, M_MAX,
+    GAMMA_MIN, GAMMA_MAX, SIGMA_INT_MIN, SIGMA_INT_MAX,
+    A_MIN, A_MAX, ZD_MIN, ZD_MAX, ZB_MIN, ZB_MAX, ZH_MIN, ZH_MAX,
+    SINT_SNE_MIN, SINT_SNE_MAX, SINT_QSO_MIN, SINT_QSO_MAX,
+    M_SNE_PRIOR_SCALE, M_QSO_PRIOR_SCALE, PENALTY_M_SIGMA,
+    BAO_PROPAGATE_CORRECTION,
+)
+from gammacdm_core import h0_local, ExceptionCounter
+from bao_desi_dr1 import (
+    Z_EFF_DESI, N_BAO_POINTS, DESI_DR1,
+    compute_chi2_bao, point_labels as _bao_point_labels,
+)
+
 warnings.filterwarnings('ignore')
+
+# Tracked counters for silent failures (kept global for the same reason as the
+# chi² functions themselves: scipy.optimize.minimize calls the objective many
+# thousands of times and we want a single-pass summary at the end).
+CAMB_ERRORS = ExceptionCounter("CAMB background")
+CHI2_ERRORS = ExceptionCounter("χ² evaluation")
+
+class TeeLogger(object):
+    def __init__(self, log_filepath):
+        self.terminal = sys.stdout
+        self.log = open(log_filepath, "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+    
+SESSION_TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+log_filename = os.path.join("logs", f"{SESSION_TIMESTAMP}_log.txt")
+sys.stdout = TeeLogger(log_filename)
+
+print("="*70)
+print(f"🌟 INICIANDO SESIÓN: {SESSION_TIMESTAMP}")
+print(f"💻 Comando: {' '.join(sys.argv)}")
+print("="*70)
 
 
 # =============================================================================
@@ -168,8 +222,12 @@ def report_model_summary(model_name, samples, args, logZ=None, title_prefix="�
         zb_err = np.std(zb_s)
         print(f"   z_b   = {zb_val:.3f} ± {zb_err:.3f} (Bubble decay scale)")
     
-    # z_h — horizon scale (Unified only)
+    # z_h — horizon scale (Unified only; may come from derived zh or from log_zh)
     zh_s = _safe_get(samples, 'zh')
+    if zh_s is None:
+        log_zh_s = _safe_get(samples, 'log_zh')
+        if log_zh_s is not None:
+            zh_s = 10**np.asarray(log_zh_s)
     if zh_s is not None:
         zh_val = np.mean(zh_s)
         zh_err = np.std(zh_s)
@@ -186,7 +244,7 @@ def report_model_summary(model_name, samples, args, logZ=None, title_prefix="�
     if a_s is not None:
         # Δμ(z=0) = A·exp(0) = A → H₀(local) = H₀(cosmo)·10^(-A/5)
         a_val_for_h0 = np.mean(a_s)
-        h0_loc = h0_val * 10**(-a_val_for_h0/5)
+        h0_loc = h0_local(h0_val, A=a_val_for_h0, z_pivot=Z_PIVOT)
         print(f"   → H₀(local) implied: {h0_loc:.2f} km/s/Mpc (Bubble shift A={a_val_for_h0:.3f})")
 
     # 4. Nuisance Parameters (M)
@@ -226,8 +284,12 @@ parser.add_argument("--qso-err-cut", type=float, default=1.5, dest="qso_err_cut"
                     help="Max quasar error to include (default: 1.5 mag)")
 parser.add_argument("--sne-err-cut", type=float, default=0.5, dest="sne_err_cut",
                     help="Max supernova error to include (default: 0.5 mag)")
-parser.add_argument("--z-min", type=float, default=0.01, dest="z_min",
-                    help="Minimum redshift to include (default: 0.01, removes local peculiar velocities)")
+parser.add_argument("--z-min-sne", type=float, default=0.01, dest="z_min_sne",
+                    help="Minimum redshift to include SNe (default: 0.01, removes local peculiar velocities)")
+parser.add_argument("--z-max-sne", type=float, default=2.5, dest="z_max_sne",
+                    help="Maximum redshift to include SNe (default: 2.5, Pantheon+ max)")
+parser.add_argument("--z-min-qso", type=float, default=0.0, dest="z_min_qso",
+                    help="Minimum redshift to include QSO (default: 0.0, recommended 0.7 for cosmological fits)")
 parser.add_argument("--revised", action="store_true",
                     help="Use full_dataset_revisado.csv instead of full_dataset.csv")
 parser.add_argument("--asymmetric", action="store_true",
@@ -245,17 +307,91 @@ parser.add_argument("--nested", action="store_true",
 parser.add_argument("--nlive", type=int, default=200,
                     help="Number of live points for nested sampling (default: 200)")
 parser.add_argument("--no-nuisance", action="store_true", help="Fix calibration offsets (M_sne, M_qso) to 0")
+parser.add_argument("--no-cc", action="store_true", dest="no_cc", help="Exclude cosmic chronometers (CC) from the fit")
 parser.add_argument("--fixed-anchor", action="store_true", help="Fix H0=67.4 and M=SH0ES (M=0) for ALL models")
 parser.add_argument("--sanity-check", action="store_true", dest="sanity_check",
                     help="Internal sanity check: ΛCDM(H0=67.4,Ωm=0.315,M free) vs γCDM/Decay(H0=67.4,M removed)")
 parser.add_argument("--output-dir", type=str, default="chains", help="Output directory for nested sampling chains")
-parser.add_argument("--legacy", action="store_true", help="Include legacy models (γCDM-LINEAL, γCDM-LOG³) in MLE analysis")
+parser.add_argument("--legacy", action="store_true", help="Include legacy models (γCDM-LOG², γCDM-Decay, γCDM-LINEAL, γCDM-LOG³) in MLE analysis")
 parser.add_argument("--student", action="store_true", help="Use Student-t likelihood (robust to outliers, default ν=5)")
 parser.add_argument("--cauchy", action="store_true", help="Use Cauchy likelihood (ν=1, maximum robustness)")
 parser.add_argument("--nu", type=float, default=5.0, help="Degrees of freedom for Student-t (default: 5.0)")
 parser.add_argument("--cov", type=str, default="none", choices=["none", "stat", "sys"],
                     help="Covariance matrix type for SNe Ia (default: 'none', 'stat' for STATONLY, 'sys' for STAT+SYS)")
+parser.add_argument("--evo", action="store_true",
+                    help="Use differential_evolution global optimizer instead of random-restart Nelder-Mead")
+parser.add_argument("--cmb", action="store_true",
+                    help="Add CMB shift parameter prior (Planck 2018 R=1.7502±0.0046, constrains z_h)")
+parser.add_argument("--fit-scatter", action="store_true", dest="fit_scatter",
+                    help="Fit intrinsic scatter σ_int,SNe and σ_int,QSO as free parameters (ignores --sigma-int-*)")
+parser.add_argument("--camb-tab", action="store_true",
+                    help="Pre-tabulate CAMB background grid for faster evaluation")
+parser.add_argument("--penalty-m", action="store_true",
+                    help="Penalize high calibration parameters to prevent degeneracies")
+parser.add_argument("--sh0es", action="store_true",
+                    help="Add SH0ES local H0 prior (73.04 ± 1.04) to penalty")
+parser.add_argument("--no-bubble", action="store_true", dest="no_bubble",
+                    help="Test LOG²-Decay without local bubble: Δμ = γ₀·[ln(1+z)]²·exp(-z/z_h) only (Kerr-Only / Occam test)")
+parser.add_argument("--paper", action="store_true",
+                    help="Publication-ready output: strip emojis, pin cosmetic formatting, silence advisory lines")
+parser.add_argument("--snapshot-chi2", type=str, default=None, dest="snapshot_chi2",
+                    help="Regression hook: compute χ² for a fixed set of parameter vectors "
+                         "against all 12 chi2_* functions AND exit before the MLE loop. "
+                         "Writes a JSON to the given path. Use this before and after a refactor "
+                         "to verify bit-compatibility: python test_regression.py --validate.")
+
+# ── BAO / DESI DR1 options (Stage 7) ────────────────────────────────────────
+# Two mutually exclusive modes:
+#   --bao       : DESI DR1 enters the joint likelihood (SNe+QSO+CC+CMB+BAO).
+#                 The minimizer trades off all datasets. Numbers CHANGE.
+#   --bao-null  : DESI DR1 is a post-fit null test. The MLE is run WITHOUT
+#                 BAO in the objective, and χ²_BAO is evaluated at the
+#                 best-fit parameters for each model as a goodness-of-fit
+#                 diagnostic. Numbers of the MLE do NOT change; only an
+#                 extra diagnostic table is printed at the end.
+#
+# The propagation of the Δμ(z) correction to BAO D_M is controlled by
+# cosmo_constants.BAO_PROPAGATE_CORRECTION (default False, "flux-level"
+# interpretation). See bao_desi_dr1.py for the algebra.
+_bao_group = parser.add_mutually_exclusive_group()
+_bao_group.add_argument("--bao", action="store_true",
+                    help="Add DESI DR1 BAO (12 points, Adame+24) to the joint likelihood. "
+                         "The γCDM correction Δμ(z) propagates (if BAO_PROPAGATE_CORRECTION is True) to D_M via 10^(Δμ/5); "
+                         "D_H stays ΛCDM. Requires CAMB rdrag (computed per-eval).")
+_bao_group.add_argument("--bao-null", action="store_true", dest="bao_null",
+                    help="Post-fit null test with DESI DR1: fit the model without BAO, "
+                         "then evaluate χ²_BAO at the best-fit to diagnose SNe-vs-BAO "
+                         "consistency. Does NOT change the MLE results, only adds a "
+                         "diagnostic table.")
 args = parser.parse_args()
+
+
+# ── Publication-ready output hook (--paper) ─────────────────────────────────
+# When --paper is active we wrap builtins.print to strip emoji code points.
+# This is a post-processing hook; existing print(...) calls throughout the
+# file stay untouched. The regex matches the Unicode pictograph ranges
+# commonly used for emojis and symbol sets found in the current output.
+if args.paper:
+    import builtins as _builtins
+    import re as _re
+    # Strip decorative pictographs while preserving structural punctuation
+    # (arrows ← → ↔, en/em dashes, Greek letters, math symbols).
+    _EMOJI_RE = _re.compile(
+        "["
+        "\U0001F300-\U0001FAFF"     # Pictographs / extended symbols
+        "\U00002700-\U000027BF"     # Dingbats
+        "\U0001F600-\U0001F64F"     # Emoticons
+        "\U0001F680-\U0001F6FF"     # Transport & map
+        "\u2705\u2714\u2716\u274C\u26A0\u26A1\u2728\u2B50"  # ✅✔✖❌⚠⚡✨⭐
+        "]",
+        flags=_re.UNICODE,
+    )
+    _orig_print = _builtins.print
+    def _paper_print(*objs, **kwargs):
+        cleaned = [_EMOJI_RE.sub("", o) if isinstance(o, str) else o for o in objs]
+        _orig_print(*cleaned, **kwargs)
+    _builtins.print = _paper_print
+# ────────────────────────────────────────────────────────────────────────────
 
 
 # ============================================================================
@@ -266,12 +402,32 @@ print("🛡️  γCDM ROBUSTNESS VERIFICATION PROTOCOL")
 print("=" * 70)
 print(f"   ⚙️  Intrinsic scatter: σ_int,SNe = {args.sigma_int_sne:.2f}, σ_int,QSO = {args.sigma_int_qso:.2f}")
 print(f"   ⚙️  Physical prior: Ωm < 1 enforced (flat ΛCDM with ΩΛ ≥ 0)")
+if args.evo:
+    print(f"   ⚙️  Optimizer: EVO (5 × differential evolution ensemble + dual_annealing + multi-polish + perturbation test)")
+if args.cmb:
+    print(f"   ⚙️  CMB prior: Planck 2018 shift parameter R = 1.7502 ± 0.0046")
+if args.sh0es:
+    print(f"   ⚙️  SH0ES prior: H0 = 73.04 ± 1.04 km/s/Mpc")
+    if args.cov in ["stat", "sys"]:
+        print(f"   ⚠️  WARNING: Double counting! Pantheon+ covariance already includes SH0ES calibration. To test prior safely, use --cov none.")
+if args.fit_scatter:
+    print(f"   ⚙️  Fitting σ_int,SNe and σ_int,QSO as free parameters")
+if args.no_bubble:
+    print(f"   ⚙️  NO-BUBBLE mode: testing Kerr-Only variant (A=0, z_b removed)")
+if args.no_cc:
+    print(f"   ⚙️  CC excluded: cosmic chronometers removed from the fit")
+print(f"   ⚙️  SNe z-range: [{args.z_min_sne}, {args.z_max_sne}]")
+if args.bao:
+    _prop = "ON (D_M scaled by 10^(Δμ/5))" if BAO_PROPAGATE_CORRECTION else "OFF (BAO sees ΛCDM only)"
+    print(f"   ⚙️  BAO (DESI DR1): In the fit — {N_BAO_POINTS} points, Δμ→D_M {_prop}")
+if args.bao_null:
+    print(f"   ⚙️  BAO (DESI DR1): Null test (post-fit diagnostic, not in objective)")
 
 # ── Determine likelihood type ──
 if args.cauchy:
     LIKELIHOOD_TYPE = 'cauchy'
     NU_DOF = 1.0
-    print(f"   ⚙️  Likelihood: CAUCHY (ν=1, maximum robustness)")
+    print(f"   ⚙️  Likelihood: Cauchy (ν=1, maximum robustness)")
 elif args.student:
     LIKELIHOOD_TYPE = 'student'
     NU_DOF = args.nu
@@ -305,11 +461,11 @@ df.loc[df['probe'] == 'sne_ia', 'cov_idx'] = sne_all['cov_idx'].values
 
 if args.quasars_only:
     # ── QUASARS ONLY (high-z test) ──
-    print(f"\n🔭 MODE: Quasars only (high-z test, err < {args.qso_err_cut})")
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min)]
+    print(f"\n🔭 MODE: Quasars only (high-z test, err < {args.qso_err_cut}, z > {args.z_min_qso})")
+    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min_qso)]
 
     print(f"\n📊 Dataset:")
-    print(f"   Quasars: {len(qso)} pts (μ observable, err < {args.qso_err_cut})")
+    print(f"   Quasars: {len(qso)} pts (μ observable, err < {args.qso_err_cut}, z > {args.z_min_qso})")
     print(f"   z range: {qso['z'].min():.2f} – {qso['z'].max():.2f}")
     print(f"   ⟨σ⟩ = {qso['err'].mean():.2f} mag")
 
@@ -327,12 +483,12 @@ if args.quasars_only:
 
 elif args.no_quasars:
     # ── SNe Ia + CC (sin quasars) ──
-    print(f"\n🔭 MODE: SNe Ia (err < {args.sne_err_cut}, z > {args.z_min}) + CC (sin quasars)")
-    sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min)]
-    cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
+    print(f"\n🔭 MODE: SNe Ia (err < {args.sne_err_cut}, {args.z_min_sne} < z < {args.z_max_sne}) + CC (sin quasars)")
+    sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min_sne) & (df['z'] < args.z_max_sne)]
+    cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')] if not args.no_cc else df.iloc[0:0]
 
     print(f"\n📊 Dataset:")
-    print(f"   SNe Ia: {len(sne)} pts (μ, err < {args.sne_err_cut}, z > {args.z_min})")
+    print(f"   SNe Ia: {len(sne)} pts (μ, err < {args.sne_err_cut}, {args.z_min_sne} < z < {args.z_max_sne})")
     print(f"   CC:     {len(cc)} pts (H)")
     print(f"   Total:  {len(sne) + len(cc)} pts")
 
@@ -350,9 +506,9 @@ elif args.no_quasars:
 
 else:
     # ── DEFAULT: SNe Ia (err < cut) + Quasars (err < cut) + CC ──
-    sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min)]
-    cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min_sne) & (df['z'] < args.z_max_sne)]
+    cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')] if not args.no_cc else df.iloc[0:0]
+    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min_qso)]
 
     n_sne = len(sne)
     n_qso = len(qso)
@@ -363,11 +519,11 @@ else:
     sne_mask[:n_sne] = True
     qso_mask = ~sne_mask
 
-    print(f"\n🔭 MODE: SNe Ia (err < {args.sne_err_cut}, z > {args.z_min}) + Quasars (err < {args.qso_err_cut}) + CC")
+    print(f"\n🔭 MODE: SNe Ia (err < {args.sne_err_cut}, {args.z_min_sne} < z < {args.z_max_sne}) + Quasars (err < {args.qso_err_cut}, z > {args.z_min_qso}) + CC")
     print(f"\n📊 Dataset:")
-    print(f"   SNe Ia:   {n_sne} pts (μ, err < {args.sne_err_cut}, z > {args.z_min})")
-    print(f"   Quasars:  {n_qso} pts (μ, err < {args.qso_err_cut})")
-    print(f"   CC:       {len(cc)} pts (H)")
+    print(f"   SNe Ia:   {n_sne} pts (μ, err < {args.sne_err_cut}, {args.z_min_sne} < z < {args.z_max_sne})")
+    print(f"   Quasars:  {n_qso} pts (μ, err < {args.qso_err_cut}, z > {args.z_min_qso})")
+    print(f"   CC:       {len(cc)} pts (H){' [EXCLUDED]' if args.no_cc else ''}")
     print(f"   Total μ:  {len(mu_data)} pts")
     print(f"   z range:  {mu_data['z'].min():.2f} – {mu_data['z'].max():.2f}")
 
@@ -389,20 +545,27 @@ if not COMBINED_MODE:
 # Extract Covariance Matrix if requested and applicable
 C_inv_sne = None
 ln_det_C_sne = None
+_cov_evals = None
+_cov_evecs = None
 
 if args.cov != 'none' and not args.quasars_only:
     # Build file path
     cov_file = f"Pantheon+SH0ES_STATONLY.cov" if args.cov == 'stat' else f"Pantheon+SH0ES_STAT+SYS.cov"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cov_path = os.path.join(script_dir, cov_file)
     
-    if not os.path.exists(cov_file):
-        raise FileNotFoundError(f"Covariance matrix {cov_file} not found.")
+    if not os.path.exists(cov_path):
+        # Try one level up
+        cov_path = os.path.join(os.path.dirname(script_dir), cov_file)
+        if not os.path.exists(cov_path):
+             raise FileNotFoundError(f"Covariance matrix {cov_file} not found locally or in parent dir.")
 
-    print(f"\n🧮 Loading Correlated SNe Covariance: {cov_file}")
-    with open(cov_file, 'r') as f:
+    print(f"\n🧮 Loading Correlated SNe Covariance: {cov_path}")
+    with open(cov_path, 'r') as f:
         first_line = f.readline().strip()
         C_dim = int(first_line)
     
-    C_flat = np.loadtxt(cov_file, skiprows=1)
+    C_flat = np.loadtxt(cov_path, skiprows=1)
     C_full = C_flat.reshape(C_dim, C_dim)
     
     # Extract the indices of the filtered SNe
@@ -412,9 +575,16 @@ if args.cov != 'none' and not args.quasars_only:
     # Submatrix
     C_sne = C_full[np.ix_(sne_idx, sne_idx)]
     
-    # Add intrinsic scatter to the diagonal of the covariance matrix
-    # note: args.sigma_int_sne is used from CLI
-    if args.sigma_int_sne > 0:
+    # Eigendecompose base covariance for --fit-scatter (efficient σ_int updates)
+    _cov_evals = None
+    _cov_evecs = None
+    if args.fit_scatter:
+        print(f"   Eigendecomposing base covariance for σ_int fitting...")
+        _cov_evals, _cov_evecs = np.linalg.eigh(C_sne)
+        _cov_evals = np.maximum(_cov_evals, 1e-15)
+        print(f"   Eigendecomposition done ({len(_cov_evals)} modes, λ_min={_cov_evals[0]:.2e}, λ_max={_cov_evals[-1]:.2e})")
+    
+    if not args.fit_scatter and args.sigma_int_sne > 0:
         print(f"   Adding SNe intrinsic scatter (σ_int = {args.sigma_int_sne}) to the covariance diagonal...")
         np.fill_diagonal(C_sne, C_sne.diagonal() + args.sigma_int_sne**2)
     
@@ -438,6 +608,9 @@ except ImportError:
     print("\n❌ CAMB not available. Install with: pip install camb")
     exit(1)
 
+# Global tracker for the physical chi2 (quadratic term) only for reporting
+GLOBAL_CHI2 = 0.0
+
 
 # ============================================================================
 # χ² FUNCTIONS WITH δM NUISANCE + INTRINSIC SCATTER
@@ -446,29 +619,50 @@ except ImportError:
 #   H₀:       [40, 100]
 #   Ωch²:     [0.01, 0.35]  → but we also enforce Ωm < 1 (physical)
 #   δM:       [−3.0, 3.0]
-#   γ:        [−2.0, 1.0]
+#   γ:        [−3.0, 3.0]
 #   σ_int:    [0.0, 2.0]    → intrinsic scatter (QSO and optionally SNe)
 # ============================================================================
 
-H0_MIN, H0_MAX = 40, 100
-OMCH2_MIN, OMCH2_MAX = 0.01, 0.35
-M_MIN, M_MAX = -3.0, 3.0
-GAMMA_MIN, GAMMA_MAX = -3.0, 3.0
-SIGMA_INT_MIN, SIGMA_INT_MAX = 0.0, 2.0
-A_MIN, A_MAX = -3.0, 3.0
-ZD_MIN, ZD_MAX = 0.01, 10.0
-# Unified model (log_decay): two separate decay scales
-ZB_MIN, ZB_MAX = 0.01, 10.0     # Bubble scale (local, short-range)
-ZH_MIN, ZH_MAX = 0.01, 1e10    # Horizon scale (Kerr geometry, long-range)
+# All prior bounds, physical constants and external calibration values are now
+# imported from cosmo_constants at the top of the file. Do NOT redefine any of
+# H0_MIN, H0_MAX, OMCH2_MIN, OMCH2_MAX, M_MIN, M_MAX, GAMMA_MIN, GAMMA_MAX,
+# A_MIN, A_MAX, ZD/ZB/ZH bounds, SINT_SNE/QSO bounds, Z_STAR, R_PLANCK,
+# SIGMA_R_PLANCK, SIGMA_CORR_CMB, C_LIGHT_KMS here.
 
-# Intrinsic scatter from CLI arguments (added in quadrature to observational errors)
+# Runtime-configurable (comes from CLI, not a physical constant)
 SIGMA_INT_SNE = args.sigma_int_sne   # ~0.1 mag typical for Pantheon+ without cov
 SIGMA_INT_QSO = args.sigma_int_qso   # User-specified, try 0.3-0.6 for robustness test
 
+USE_CMB = args.cmb
+FIT_SCATTER = args.fit_scatter
+USE_EVO = args.evo
+
+# BAO (DESI DR1) wiring. `USE_BAO_FIT` means BAO enters the joint likelihood;
+# `USE_BAO_NULL` means BAO is evaluated only at the post-fit as a diagnostic.
+# Both flags imply the CAMB background extras (rdrag, D_M(Z_EFF), D_H(Z_EFF))
+# must be computed — that's governed by `NEED_BAO_BG`.
+USE_BAO_FIT  = bool(args.bao)
+USE_BAO_NULL = bool(args.bao_null)
+NEED_BAO_BG  = USE_BAO_FIT or USE_BAO_NULL
+
+# Precompute effective errors (model-independent, used for δM profiling)
+if COMBINED_MODE:
+    ERR_EFF_MU = np.sqrt(err_mu**2 + np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)**2)
+else:
+    ERR_EFF_MU = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
 
 
 GLOBAL_EVAL_MODE = False
 GLOBAL_EVAL_ARRAYS = {}
+
+
+def _m_penalty(m_vals):
+    """Penalize high M values (Gaussian prior, sigma=0.1) to prevent degeneracies."""
+    if not getattr(args, 'penalty_m', False):
+        return 0.0
+    if not isinstance(m_vals, (list, tuple)):
+        m_vals = [m_vals]
+    return sum((m / 0.1)**2 for m in m_vals)
 
 def _neg2logL_mu(residuals, err_eff):
     """Compute -2·ln L for distance-modulus residuals.
@@ -482,6 +676,8 @@ def _neg2logL_mu(residuals, err_eff):
         GLOBAL_EVAL_ARRAYS['residuals'] = residuals
         GLOBAL_EVAL_ARRAYS['err_eff'] = err_eff
         
+    global GLOBAL_CHI2
+    GLOBAL_CHI2 = 0.0
     neg2logL_total = 0.0
     
     # --- SPLIT RESIDUALS IF COVARIANCE IS ACTIVE ---
@@ -499,6 +695,7 @@ def _neg2logL_mu(residuals, err_eff):
         # (Note: we add N_sne * ln(2π) if we want absolute likelihood, but for relative
         #  delta-logL we just need R^T C^{-1} R + ln|C|. The diagonal Gaussian also omits 2π).
         chi2_sne = res_sne.T @ C_inv_sne @ res_sne
+        GLOBAL_CHI2 += chi2_sne
         neg2logL_total += chi2_sne + ln_det_C_sne
     else:
         # No covariance -> all points go to the diagonal evaluator
@@ -512,12 +709,14 @@ def _neg2logL_mu(residuals, err_eff):
             # -2 ln L_i = 2·ln(σ) + (ν+1)·ln(1 + r²/(ν·σ²))
             r2 = res_qso**2
             s2 = err_qso**2
+            GLOBAL_CHI2 += np.sum(r2 / s2)
             diag_term = np.sum(2 * np.log(err_qso)
                                + (nu + 1) * np.log1p(r2 / (nu * s2 + 1e-30)))
             neg2logL_total += diag_term
         else:
             # Standard Gaussian: −2 ln L = Σ[(r/σ)² + ln(σ²)]
             chi2_term = np.sum((res_qso / err_qso) ** 2)
+            GLOBAL_CHI2 += chi2_term
             norm_term = np.sum(np.log(err_qso**2))
             neg2logL_total += chi2_term + norm_term
 
@@ -534,467 +733,739 @@ def check_physical_prior(H0, omch2):
     return 0 < Om < 1.0  # Physical flat ΛCDM requires 0 < Ωm < 1
 
 
-def chi2_lcdm(params):
-    """ΛCDM: 3 params (H₀, Ωch², δM) or 4 combined (H₀, Ωch², M_sne, M_qso).
+
+def _cmb_penalty(H0, omch2, da_star, delta_mu_star=0.0):
+    """Planck 2018 shift parameter R + correction penalty at z*.
     
-    Returns -2·logL = χ² + Σlog(σ_eff²) for proper Bayesian comparison.
-    Includes physical prior Ωm < 1 and intrinsic scatter σ_eff² = σ_obs² + σ_int².
+    da_star: angular diameter distance to z* (scalar, pre-computed from table).
     """
+    if not USE_CMB:
+        return 0.0
+    Om = compute_Omega_m(H0, omch2)
+    DC_star = (1 + Z_STAR) * da_star
+    R_model = np.sqrt(Om) * (H0 / C_LIGHT_KMS) * DC_star
+    penalty = ((R_model - R_PLANCK) / SIGMA_R_PLANCK) ** 2
+    if abs(delta_mu_star) > 1e-10:
+        penalty += (delta_mu_star / SIGMA_CORR_CMB) ** 2
+    return penalty
+
+
+def _sh0es_penalty(H0_local):
+    """SH0ES local H0 prior (73.04 ± 1.04) penalty."""
+    if not getattr(args, 'sh0es', False):
+        return 0.0
+    return ((H0_local - 73.04) / 1.04) ** 2
+
+
+def _neg2logL_cov_eigbasis(res_sne, sig_int_sne):
+    """Correlated SNe -2lnL via eigendecomposition: O(N) per σ_int value.
+    
+    Uses C(σ) = U(Λ + σ²I)U^T → r^T C^{-1} r = Σ v²/(λ+σ²),
+    ln|C| = Σ ln(λ+σ²), where v = U^T r.
+    """
+    v = _cov_evecs.T @ res_sne
+    lam_eff = _cov_evals + sig_int_sne**2
+    chi2 = np.sum(v**2 / lam_eff)
+    ln_det = np.sum(np.log(lam_eff))
+    return chi2 + ln_det
+
+
+def _neg2logL_diag(residuals, err_obs, sig_int):
+    """Diagonal -2lnL with variable σ_int (for --fit-scatter)."""
+    s2 = err_obs**2 + sig_int**2
+    global GLOBAL_CHI2
+    _chi2 = np.sum(residuals**2 / s2)
+    GLOBAL_CHI2 = _chi2 # Note: child calls might overwrite, but _chi2_tail sums up components
+
+    if LIKELIHOOD_TYPE == 'student' or LIKELIHOOD_TYPE == 'cauchy':
+        nu = NU_DOF if LIKELIHOOD_TYPE == 'student' else 1.0
+        return np.sum(np.log(s2) + (nu + 1) * np.log1p(residuals**2 / (nu * s2 + 1e-30)))
+    return _chi2 + np.sum(np.log(s2))
+
+
+def _neg2logL_fit_scatter(residuals, sig_int_sne, sig_int_qso):
+    """Full -2lnL when fitting scatter: handles covariance + diagonal split."""
+    if GLOBAL_EVAL_MODE:
+        GLOBAL_EVAL_ARRAYS['residuals'] = residuals
+        if COMBINED_MODE:
+            err_eff = np.sqrt(err_mu**2 + np.where(sne_mask, sig_int_sne, sig_int_qso)**2)
+        else:
+            _is_qso_only = getattr(args, 'quasars_only', False)
+            err_eff = np.sqrt(err_mu**2 + (sig_int_qso if _is_qso_only else sig_int_sne)**2)
+        GLOBAL_EVAL_ARRAYS['err_eff'] = err_eff
+
+    # Pure chi2 for reporting
+    _chi2_mu = 0.0
+    if _cov_evals is not None:
+        _v_sne = _cov_evecs.T @ (residuals[sne_mask] if COMBINED_MODE else residuals)
+        _chi2_mu += np.sum(_v_sne**2 / (_cov_evals + sig_int_sne**2))
+        if COMBINED_MODE:
+            _chi2_mu += np.sum(residuals[qso_mask]**2 / (err_mu[qso_mask]**2 + sig_int_qso**2))
+    elif C_inv_sne is not None:
+        if COMBINED_MODE:
+            _chi2_mu += residuals[sne_mask].T @ C_inv_sne @ residuals[sne_mask]
+            _chi2_mu += np.sum(residuals[qso_mask]**2 / (err_mu[qso_mask]**2 + sig_int_qso**2))
+        else:
+            _chi2_mu += residuals.T @ C_inv_sne @ residuals
+    else:
+        if COMBINED_MODE:
+            _chi2_mu += np.sum(residuals[sne_mask]**2 / (err_mu[sne_mask]**2 + sig_int_sne**2))
+            _chi2_mu += np.sum(residuals[qso_mask]**2 / (err_mu[qso_mask]**2 + sig_int_qso**2))
+        else:
+            _chi2_mu += np.sum(residuals**2 / (err_mu**2 + sig_int_sne**2))
+    GLOBAL_CHI2 = _chi2_mu
+    
+    total = 0.0
+    if _cov_evals is not None:
+        if COMBINED_MODE:
+            total += _neg2logL_cov_eigbasis(residuals[sne_mask], sig_int_sne)
+            total += _neg2logL_diag(residuals[qso_mask], err_mu[qso_mask], sig_int_qso)
+        else:
+            total += _neg2logL_cov_eigbasis(residuals, sig_int_sne)
+    elif C_inv_sne is not None:
+        if COMBINED_MODE:
+            res_sne = residuals[sne_mask]
+            total += res_sne.T @ C_inv_sne @ res_sne + ln_det_C_sne
+            total += _neg2logL_diag(residuals[qso_mask], err_mu[qso_mask], sig_int_qso)
+        else:
+            total += residuals.T @ C_inv_sne @ residuals + ln_det_C_sne
+    else:
+        if COMBINED_MODE:
+            total += _neg2logL_diag(residuals[sne_mask], err_mu[sne_mask], sig_int_sne)
+            total += _neg2logL_diag(residuals[qso_mask], err_mu[qso_mask], sig_int_qso)
+        else:
+            sig_val = sig_int_sne
+            total += _neg2logL_diag(residuals, err_mu, sig_val)
+    return total
+
+
+# ============================================================================
+# PRE-TABULATED CAMB BACKGROUND (120×80 grid → ~40s setup, ~300× faster evals)
+# ============================================================================
+if args.camb_tab:
+    _N_H0_GRID, _N_OMCH2_GRID = 120, 80
+    _h0_grid = np.linspace(H0_MIN, H0_MAX, _N_H0_GRID)
+    _omch2_grid = np.linspace(OMCH2_MIN, OMCH2_MAX, _N_OMCH2_GRID)
+
+    import time as _time
+    _t0_tab = _time.time()
+
+    # Cache file name reflects whether BAO extras (rdrag + D_M/D_H at DESI z_eff)
+    # are required. This avoids invalidating the standard cache when users run
+    # without --bao / --bao-null, and keeps BAO runs hot.
+    _cache_file = "camb_grid_cache_bao.npz" if NEED_BAO_BG else "camb_grid_cache.npz"
+    _loaded_cache = False
+
+    if os.path.exists(_cache_file):
+        try:
+            with np.load(_cache_file) as data:
+                _mu_base_table = data["mu_base"]
+                _hz_table = data["hz"] if "hz" in data else None
+                _da_star_table = data["da_star"]
+                if NEED_BAO_BG:
+                    _rdrag_table = data["rdrag"] if "rdrag" in data else None
+                    _dm_bao_table = data["dm_bao"] if "dm_bao" in data else None
+                    _dh_bao_table = data["dh_bao"] if "dh_bao" in data else None
+                else:
+                    _rdrag_table = _dm_bao_table = _dh_bao_table = None
+
+                _shape_ok = _mu_base_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(z_mu))
+                _hz_ok = (_hz_table is None
+                          or _hz_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(z_cc)))
+                _bao_ok = (not NEED_BAO_BG) or (
+                    _rdrag_table is not None
+                    and _rdrag_table.shape == (_N_H0_GRID, _N_OMCH2_GRID)
+                    and _dm_bao_table is not None
+                    and _dm_bao_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI))
+                    and _dh_bao_table is not None
+                    and _dh_bao_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI))
+                )
+                if _shape_ok and _hz_ok and _bao_ok:
+                    _loaded_cache = True
+                    print(f"\n⚡ Cargando grid CAMB desde caché ({_cache_file})...")
+        except Exception:
+            pass
+
+    if not _loaded_cache:
+        _bao_suffix = " +rdrag/D_M/D_H(DESI z_eff)" if NEED_BAO_BG else ""
+        print(f"\n⏳ Pre-tabulando CAMB background ({_N_H0_GRID}×{_N_OMCH2_GRID} grid){_bao_suffix}...")
+
+        _mu_base_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(z_mu)))
+        _hz_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(z_cc))) if len(z_cc) > 0 else None
+        _da_star_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID))
+        if NEED_BAO_BG:
+            _rdrag_table  = np.empty((_N_H0_GRID, _N_OMCH2_GRID))
+            _dm_bao_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI)))
+            _dh_bao_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI)))
+        else:
+            _rdrag_table = _dm_bao_table = _dh_bao_table = None
+
+        for _i_h0, _h0_val in enumerate(_h0_grid):
+            for _j_oc, _oc_val in enumerate(_omch2_grid):
+                _Om_check = (_oc_val + OMBH2_FIDUCIAL) / (_h0_val / 100) ** 2
+                if _Om_check <= 0.0:
+                    _mu_base_table[_i_h0, _j_oc, :] = np.nan
+                    if _hz_table is not None:
+                        _hz_table[_i_h0, _j_oc, :] = np.nan
+                    _da_star_table[_i_h0, _j_oc] = np.nan
+                    if NEED_BAO_BG:
+                        _rdrag_table[_i_h0, _j_oc] = np.nan
+                        _dm_bao_table[_i_h0, _j_oc, :] = np.nan
+                        _dh_bao_table[_i_h0, _j_oc, :] = np.nan
+                    continue
+                try:
+                    _pars_tab = camb.CAMBparams()
+                    _pars_tab.WantTransfer = False
+                    _pars_tab.WantCls = False
+                    _pars_tab.set_cosmology(H0=_h0_val, ombh2=OMBH2_FIDUCIAL, omch2=_oc_val)
+                    _r_tab = camb.get_background(_pars_tab)
+                    _mu_base_table[_i_h0, _j_oc, :] = (
+                        5.0 * np.log10(np.maximum(_r_tab.luminosity_distance(z_mu), 1e-10)) + 25.0
+                    )
+                    if _hz_table is not None:
+                        _hz_table[_i_h0, _j_oc, :] = _r_tab.hubble_parameter(z_cc)
+                    _da_star_table[_i_h0, _j_oc] = _r_tab.angular_diameter_distance(Z_STAR)
+                    if NEED_BAO_BG:
+                        # D_M(z) = comoving radial distance (flat FRW); D_H(z) = c/H(z).
+                        _dm_bao_table[_i_h0, _j_oc, :] = _r_tab.comoving_radial_distance(Z_EFF_DESI)
+                        _dh_bao_table[_i_h0, _j_oc, :] = C_LIGHT_KMS / _r_tab.hubble_parameter(Z_EFF_DESI)
+                        # r_d from CAMB derived params (sound horizon at drag, Mpc)
+                        try:
+                            _rdrag_table[_i_h0, _j_oc] = _r_tab.get_derived_params()["rdrag"]
+                        except Exception:
+                            _rdrag_table[_i_h0, _j_oc] = np.nan
+                except Exception:
+                    _mu_base_table[_i_h0, _j_oc, :] = np.nan
+                    if _hz_table is not None:
+                        _hz_table[_i_h0, _j_oc, :] = np.nan
+                    _da_star_table[_i_h0, _j_oc] = np.nan
+                    if NEED_BAO_BG:
+                        _rdrag_table[_i_h0, _j_oc] = np.nan
+                        _dm_bao_table[_i_h0, _j_oc, :] = np.nan
+                        _dh_bao_table[_i_h0, _j_oc, :] = np.nan
+
+        # Fill non-physical NaN cells with nearest physical neighbor so cubic
+        # spline construction gets all-finite values.  The chi² functions already
+        # reject non-physical (Ωm ≥ 1) points via check_physical_prior() before
+        # calling _fast_camb_bg, so these padded values are never actually used.
+        _nan_mask_2d = np.isnan(_da_star_table)
+        _n_nan = int(np.sum(_nan_mask_2d))
+        if _n_nan > 0:
+            from scipy.ndimage import distance_transform_edt
+            _, _nn_idx = distance_transform_edt(_nan_mask_2d, return_indices=True)
+            _da_star_table = _da_star_table[tuple(_nn_idx)]
+            for _kz in range(_mu_base_table.shape[2]):
+                _mu_base_table[:, :, _kz] = _mu_base_table[:, :, _kz][tuple(_nn_idx)]
+            if _hz_table is not None:
+                for _kz in range(_hz_table.shape[2]):
+                    _hz_table[:, :, _kz] = _hz_table[:, :, _kz][tuple(_nn_idx)]
+            if NEED_BAO_BG:
+                _rdrag_table = _rdrag_table[tuple(_nn_idx)]
+                for _kz in range(_dm_bao_table.shape[2]):
+                    _dm_bao_table[:, :, _kz] = _dm_bao_table[:, :, _kz][tuple(_nn_idx)]
+                    _dh_bao_table[:, :, _kz] = _dh_bao_table[:, :, _kz][tuple(_nn_idx)]
+            print(f"   📐 {_n_nan} non-physical grid cells padded (nearest-neighbor)")
+
+        try:
+            _save_kwargs = {"mu_base": _mu_base_table, "da_star": _da_star_table}
+            if _hz_table is not None:
+                _save_kwargs["hz"] = _hz_table
+            if NEED_BAO_BG:
+                _save_kwargs["rdrag"]  = _rdrag_table
+                _save_kwargs["dm_bao"] = _dm_bao_table
+                _save_kwargs["dh_bao"] = _dh_bao_table
+            np.savez(_cache_file, **_save_kwargs)
+            print(f"   💾 Grid guardado exitosamente en {_cache_file}")
+        except Exception as e:
+            print(f"   ⚠️ No se pudo guardar caché: {e}")
+
+    _mu_base_interp = RegularGridInterpolator(
+        (_h0_grid, _omch2_grid), _mu_base_table,
+        method='cubic', bounds_error=False, fill_value=None,
+    )
+    _hz_interp = (
+        RegularGridInterpolator(
+            (_h0_grid, _omch2_grid), _hz_table,
+            method='cubic', bounds_error=False, fill_value=None,
+        ) if _hz_table is not None else None
+    )
+    _da_star_interp = RegularGridInterpolator(
+        (_h0_grid, _omch2_grid), _da_star_table,
+        method='cubic', bounds_error=False, fill_value=None,
+    )
+    if NEED_BAO_BG:
+        _rdrag_interp = RegularGridInterpolator(
+            (_h0_grid, _omch2_grid), _rdrag_table,
+            method='cubic', bounds_error=False, fill_value=None,
+        )
+        _dm_bao_interp = RegularGridInterpolator(
+            (_h0_grid, _omch2_grid), _dm_bao_table,
+            method='cubic', bounds_error=False, fill_value=None,
+        )
+        _dh_bao_interp = RegularGridInterpolator(
+            (_h0_grid, _omch2_grid), _dh_bao_table,
+            method='cubic', bounds_error=False, fill_value=None,
+        )
+    else:
+        _rdrag_interp = _dm_bao_interp = _dh_bao_interp = None
+
+    _dt_tab = _time.time() - _t0_tab
+    print(f"   ✅ Tabla CAMB construida en {_dt_tab:.1f}s "
+      f"({_N_H0_GRID}×{_N_OMCH2_GRID} = {_N_H0_GRID*_N_OMCH2_GRID} puntos)")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Shared helpers for the chi2_* family (Stage 4b refactor).
+#
+# The 14 chi2_* functions below all share the same tail once cosmology
+# (H0, omch2), calibration offsets (M_sne/M_qso/δM) and the correction array
+# Δμ(z) are known. `_chi2_tail` encapsulates that tail:
+#   · CAMB background call (with exception tracking)
+#   · μ_th = μ_base + offset + correction
+#   · residuals → log-likelihood (Gaussian / Student-t / Cauchy / correlated)
+#   · CC term (if any)
+#   · M-penalty, CMB shift-parameter penalty, SH0ES penalty
+#
+# `_extract_fit_scatter` pops σ_int,SNe/QSO from the tail of `params` when
+# FIT_SCATTER is active for a supporting spec (ΛCDM / LOG²-Decay).
+#
+# These helpers preserve EXACT numerical behavior of the original
+# hand-written chi2_* bodies; any deviation would fail the regression
+# test `test_regression.py --validate`.
+# ────────────────────────────────────────────────────────────────────────────
+
+def _extract_fit_scatter(params, supported):
+    """Pop σ_int parameters from the tail of `params` if FIT_SCATTER is on.
+
+    Returns (sig_sne, sig_qso, ok). When FIT_SCATTER is off or the spec
+    does not support it, (SIGMA_INT_SNE, SIGMA_INT_QSO, True) is returned
+    and `params` is left untouched. On prior violation ok=False.
+    """
+    if not (FIT_SCATTER and supported):
+        return SIGMA_INT_SNE, SIGMA_INT_QSO, True
+    if COMBINED_MODE:
+        _sig_qso = params.pop()
+        _sig_sne = params.pop()
+        if not (SINT_SNE_MIN < _sig_sne < SINT_SNE_MAX):
+            return None, None, False
+        if not (SINT_QSO_MIN < _sig_qso < SINT_QSO_MAX):
+            return None, None, False
+        return _sig_sne, _sig_qso, True
+    _sig_sne = params.pop()
+    if not (SINT_SNE_MIN < _sig_sne < SINT_SNE_MAX):
+        return None, None, False
+    return _sig_sne, _sig_sne, True
+
+
+def _chi2_tail(H0, omch2, correction_arr,
+               M_sne=0.0, M_qso=0.0, delta_M=0.0,
+               sig_sne=None, sig_qso=None,
+               use_cmb=False, delta_mu_star=0.0,
+               use_m_penalty=False,
+               H0_local=None,
+               bao_correction_zeff=None):
+    """Common -2·lnL backbone shared by the entire chi2_* family.
+
+    Encapsulates CAMB call, μ assembly, likelihood (Gaussian or robust via
+    `_neg2logL_mu` / `_neg2logL_fit_scatter`), CC term, the three penalties
+    (M, CMB, SH0ES) and — when --bao is active — the DESI DR1 BAO χ² term.
+
+    Parameters
+    ----------
+    bao_correction_zeff : (N_Z_EFF,) ndarray or None
+        Δμ evaluated at Z_EFF_DESI for this model. When USE_BAO_FIT is True
+        and this array is provided, BAO enters the fit via D_M_model =
+        D_M_ΛCDM · 10^(Δμ/5). Ignored otherwise.
+    """
+    global GLOBAL_CHI2
+    try:
+        mu_th_base, _hz_pred, _da_star, _bao_extras = _fast_camb_bg(
+            H0, omch2, want_bao=USE_BAO_FIT
+        )
+        if mu_th_base is None:
+            return 1e10
+
+        if COMBINED_MODE:
+            mu_th = mu_th_base + np.where(sne_mask, M_sne, M_qso) + correction_arr
+        else:
+            mu_th = mu_th_base + delta_M + correction_arr
+
+        residuals = mu_obs - mu_th
+        if FIT_SCATTER and sig_sne is not None:
+            # Only reached for ΛCDM and LOG²-Decay (the two specs that
+            # support --fit-scatter). The fitted σ_int values drive a
+            # Gaussian log-likelihood via _neg2logL_fit_scatter.
+            neg2logL_mu = _neg2logL_fit_scatter(residuals, sig_sne, sig_qso)
+        else:
+            if COMBINED_MODE:
+                _s = sig_sne if sig_sne is not None else SIGMA_INT_SNE
+                _q = sig_qso if sig_qso is not None else SIGMA_INT_QSO
+                err_eff = np.sqrt(err_mu**2 + np.where(sne_mask, _s, _q) ** 2)
+            else:
+                err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE ** 2)
+            neg2logL_mu = _neg2logL_mu(residuals, err_eff)
+
+        if len(z_cc) > 0:
+            chi2_cc = np.sum(((H_obs - _hz_pred) / err_cc) ** 2)
+            norm_cc = np.sum(np.log(err_cc ** 2))
+        else:
+            chi2_cc = norm_cc = 0
+
+        total = neg2logL_mu + chi2_cc + norm_cc
+        if use_m_penalty:
+            total += _m_penalty([M_sne, M_qso] if COMBINED_MODE else delta_M)
+        if use_cmb:
+            total += _cmb_penalty(H0, omch2, _da_star, delta_mu_star)
+        total += _sh0es_penalty(H0 if H0_local is None else H0_local)
+
+        # ── BAO (DESI DR1) likelihood term ──────────────────────────────────
+        # Only active when --bao is passed (USE_BAO_FIT). For --bao-null the
+        # diagnostic is computed post-fit (see `_bao_null_test_report`),
+        # preserving bit-exact MLE results.
+        if USE_BAO_FIT and _bao_extras is not None:
+            dm_zeff = _bao_extras["dm"]
+            dh_zeff = _bao_extras["dh"]
+            if BAO_PROPAGATE_CORRECTION and bao_correction_zeff is not None:
+                # D_M_model / r_d = (D_M_ΛCDM · 10^(Δμ/5)) / r_d
+                dm_zeff = dm_zeff * (10.0 ** (bao_correction_zeff / 5.0))
+            chi2_bao, _ = compute_chi2_bao(dm_zeff, dh_zeff, _bao_extras["rdrag"])
+            total += chi2_bao
+            GLOBAL_CHI2 += chi2_bao
+        return total
+    except Exception as e:
+        CAMB_ERRORS.record(e)
+        return 1e10
+
+
+def _bao_corr_at(z_arr, kind, *,
+                 gamma=0.0, gamma_0=0.0,
+                 A=0.0, z_b=1.0, z_h=1e10, zd=1.0):
+    """Δμ(z) at arbitrary redshift array for the given model `kind`.
+
+    `kind` ∈ {"lcdm", "gcdm", "linear", "log2", "log3", "decay", "log_decay"}.
+    Keeps the exact same algebra used inline in each chi2_* wrapper for the
+    z_mu grid — so the BAO prediction at DESI z_eff is bit-consistent with the
+    SNe µ prediction.
+    """
+    z = np.asarray(z_arr, dtype=float)
+    if kind == "lcdm":
+        return np.zeros_like(z)
+    if kind == "gcdm":
+        return gamma * np.log(1.0 + z)
+    if kind == "linear":
+        return gamma_0 * (1.0 + z) * np.log(1.0 + z)
+    if kind == "log2":
+        return gamma_0 * np.log(1.0 + z) ** 2
+    if kind == "log3":
+        return gamma_0 * np.log(1.0 + z) ** 3
+    if kind == "decay":
+        return A * np.exp(-z / zd)
+    if kind == "log_decay":
+        return A * np.exp(-z / z_b) + gamma_0 * np.log(1.0 + z) ** 2 * np.exp(-z / z_h)
+    raise ValueError(f"Unknown correction kind: {kind!r}")
+
+
+def _bao_corr_if_fit(kind, **kwargs):
+    """Δμ at Z_EFF_DESI if BAO is in the fit, else None (no work done)."""
+    if not USE_BAO_FIT:
+        return None
+    return _bao_corr_at(Z_EFF_DESI, kind, **kwargs)
+
+
+def _fast_camb_bg(H0, omch2, want_bao=False):
+    """Interpolated CAMB background OR on-the-fly exact computation.
+
+    Returns (mu_base, hz_pred, da_star, bao_extras).
+
+    When `want_bao` is False (default), `bao_extras` is None and the BAO
+    arrays are never computed — no extra CAMB work and no interpolator call.
+    When `want_bao` is True, `bao_extras` is a dict
+        {"rdrag": float, "dm": (7,) ndarray, "dh": (7,) ndarray}
+    with D_M and D_H evaluated at Z_EFF_DESI [Mpc].
+    """
+    if args.camb_tab:
+        pt = np.array([[H0, omch2]])
+        mu_base = np.ravel(_mu_base_interp(pt))
+        hz_pred = np.ravel(_hz_interp(pt)) if _hz_interp is not None else np.array([])
+        da_star = float(_da_star_interp(pt))
+        if np.any(np.isnan(mu_base)) or np.isnan(da_star):
+            return None, None, None, None
+        bao_extras = None
+        if want_bao and _rdrag_interp is not None:
+            rdrag = float(_rdrag_interp(pt))
+            dm = np.ravel(_dm_bao_interp(pt))
+            dh = np.ravel(_dh_bao_interp(pt))
+            if np.isnan(rdrag) or np.any(np.isnan(dm)) or np.any(np.isnan(dh)):
+                return None, None, None, None
+            bao_extras = {"rdrag": rdrag, "dm": dm, "dh": dh}
+        return mu_base, hz_pred, da_star, bao_extras
+    else:
+        try:
+            pars_tab = camb.CAMBparams()
+            pars_tab.WantTransfer = False
+            pars_tab.WantCls = False
+            pars_tab.set_cosmology(H0=H0, ombh2=OMBH2_FIDUCIAL, omch2=omch2)
+            r_tab = camb.get_background(pars_tab)
+            mu_base = 5.0 * np.log10(np.maximum(r_tab.luminosity_distance(z_mu), 1e-10)) + 25.0
+            hz_pred = r_tab.hubble_parameter(z_cc) if len(z_cc) > 0 else np.array([])
+            da_star = r_tab.angular_diameter_distance(Z_STAR)
+            bao_extras = None
+            if want_bao:
+                dm = r_tab.comoving_radial_distance(Z_EFF_DESI)
+                dh = C_LIGHT_KMS / r_tab.hubble_parameter(Z_EFF_DESI)
+                try:
+                    rdrag = float(r_tab.get_derived_params()["rdrag"])
+                except Exception:
+                    rdrag = float("nan")
+                if np.isnan(rdrag):
+                    return None, None, None, None
+                bao_extras = {"rdrag": rdrag, "dm": dm, "dh": dh}
+            return mu_base, hz_pred, da_star, bao_extras
+        except Exception:
+            return None, None, None, None
+
+
+def chi2_lcdm(params):
+    """ΛCDM with optional --fit-scatter, --cmb."""
+    params = list(params)
+    _sig_sne, _sig_qso, _ok = _extract_fit_scatter(params, supported=True)
+    if not _ok:
+        return 1e10
+
     if COMBINED_MODE:
         if args.fixed_anchor or args.sanity_check:
-            # Fixed Anchor / Sanity Check for LCDM: H0=67.4, M FREE (ALWAYS)
-            # params: [omch2, M_sne, M_qso]
             H0 = 67.4
-            omch2, M_sne, M_qso = params
-                
-            if not (OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX):
-                return 1e10
+            omch2, M_sne, M_qso = params[0], params[1], params[2]
         else:
-            H0, omch2, M_sne, M_qso = params
-            if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX):
-                return 1e10
+            H0, omch2, M_sne, M_qso = params[0], params[1], params[2], params[3]
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+        if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        delta_M = 0.0
     else:
         if args.fixed_anchor or args.sanity_check:
-            # Fixed Anchor / Sanity Check for LCDM: H0=67.4, M FREE
             H0 = 67.4
-            omch2, delta_M = params
-                
-            if not (OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < delta_M < M_MAX):
-                return 1e10
+            omch2, delta_M = params[0], params[1]
         else:
-            H0, omch2, delta_M = params
-            if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
-                return 1e10
-            if not (M_MIN < delta_M < M_MAX):
-                return 1e10
+            H0, omch2, delta_M = params[0], params[1], params[2]
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+        if not (M_MIN < delta_M < M_MAX): return 1e10
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        M_sne = M_qso = 0.0
 
     if not check_physical_prior(H0, omch2):
         return 1e10
 
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-
-        if COMBINED_MODE:
-            mu_th = mu_th_base + np.where(sne_mask, M_sne, M_qso)
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            mu_th = mu_th_base + delta_M
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-
-        # -2·logL (Gaussian, Student-t, or Cauchy depending on --student/--cauchy)
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc = 0
-            norm_cc = 0
-
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, np.zeros_like(z_mu, dtype=float),
+        M_sne=M_sne, M_qso=M_qso, delta_M=delta_M,
+        sig_sne=_sig_sne, sig_qso=_sig_qso,
+        use_cmb=True, delta_mu_star=0.0,        # ΛCDM has no Δμ at z*
+        use_m_penalty=True,
+        H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("lcdm"),
+    )
 
 
 def chi2_gcdm(params):
-    """γCDM constant: Δμ = γ·ln(1+z).
-    
-    Returns -2·logL = χ² + Σlog(σ_eff²) for proper Bayesian comparison.
-    """
+    """γCDM constant: Δμ = γ·ln(1+z)."""
     if COMBINED_MODE:
         if args.fixed_anchor:
-            # Fixed Anchor: H0=67.4. M is FREE (unless no_nuisance)
-            # params: [omch2, M..., gamma]
             if args.no_nuisance:
                 omch2, gamma = params
-                M_sne, M_qso = 0.0, 0.0
-                H0 = 67.4
+                M_sne = M_qso = 0.0
             else:
                 omch2, M_sne, M_qso, gamma = params
-                H0 = 67.4
+            H0 = 67.4
         elif args.sanity_check:
-             # Sanity Check (My Models): H0=67.4, M REMOVED (Asymmetric)
-             # params: [omch2, gamma]
-             omch2, gamma = params
-             H0, M_sne, M_qso = 67.4, 0.0, 0.0
+            omch2, gamma = params
+            H0, M_sne, M_qso = 67.4, 0.0, 0.0
         else:
             H0, omch2, M_sne, M_qso, gamma = params
             if args.no_nuisance:
-                M_sne, M_qso = 0.0, 0.0
-                
-        # Bounds check logic
+                M_sne = M_qso = 0.0
         if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
         if not (GAMMA_MIN < gamma < GAMMA_MAX): return 1e10
         if not args.fixed_anchor and not args.sanity_check:
-             if not (H0_MIN < H0 < H0_MAX): return 1e10
-        
-        if not args.no_nuisance and not args.sanity_check: 
-             # Check M if it's supposed to be free
-             if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
+        if not args.no_nuisance and not args.sanity_check:
+            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
+        delta_M = 0.0
     else:
         if args.fixed_anchor:
-            # Fixed Anchor: H0=67.4, M FREE (unless no_nuisance)
             if args.no_nuisance:
                 omch2, gamma = params
                 delta_M = 0.0
-                H0 = 67.4
             else:
                 omch2, delta_M, gamma = params
-                H0 = 67.4
+            H0 = 67.4
         elif args.sanity_check:
-             # Sanity Check (My Models): H0=67.4, M REMOVED
-             omch2, gamma = params
-             H0, delta_M = 67.4, 0.0
+            omch2, gamma = params
+            H0, delta_M = 67.4, 0.0
         else:
             H0, omch2, delta_M, gamma = params
             if args.no_nuisance:
                 delta_M = 0.0
-
         if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
         if not (GAMMA_MIN < gamma < GAMMA_MAX): return 1e10
         if not args.fixed_anchor and not args.sanity_check:
-             if not (H0_MIN < H0 < H0_MAX): return 1e10
-        
+            if not (H0_MIN < H0 < H0_MAX): return 1e10
         if not args.no_nuisance and not args.sanity_check:
-             if not (M_MIN < delta_M < M_MAX): return 1e10
+            if not (M_MIN < delta_M < M_MAX): return 1e10
+        M_sne = M_qso = 0.0
 
     if not check_physical_prior(H0, omch2):
         return 1e10
 
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        gamma_corr = gamma * np.log(1 + z_mu)
-
-        if COMBINED_MODE:
-            mu_th = mu_th_base + np.where(sne_mask, M_sne, M_qso) + gamma_corr
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            mu_th = mu_th_base + delta_M + gamma_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc = 0
-            norm_cc = 0
-
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, gamma * np.log(1 + z_mu),
+        M_sne=M_sne, M_qso=M_qso, delta_M=delta_M,
+        use_m_penalty=True,
+        H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("gcdm", gamma=gamma),
+    )
 
 
 def chi2_lcdm_no_M(params):
-    # This function is not used when fixed_anchor is True (bounds logic handles it)
-    # But for completeness/safety, leave as is.
-    """ΛCDM WITHOUT δM: 2 params (H₀, Ωch²). Includes physical Ωm prior and σ_int."""
+    """ΛCDM WITHOUT δM: 2 params (H₀, Ωch²)."""
     H0, omch2 = params
     if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
         return 1e10
     if not check_physical_prior(H0, omch2):
         return 1e10
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-        mu_th = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        if COMBINED_MODE:
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, np.zeros_like(z_mu, dtype=float),
+        H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("lcdm"),
+    )
 
 
 def chi2_gcdm_no_M(params):
-    # Used when args.asymmetric is True.
-    # If fixed_anchor is also True, args.fixed_anchor takes precedence in logic,
-    # but we should ensure robustness just in case.
-    """γCDM WITHOUT δM: 3 params (H₀, Ωch², γ). Includes physical Ωm prior and σ_int."""
+    """γCDM WITHOUT δM: 3 params (H₀, Ωch², γ)."""
     if args.fixed_anchor or args.sanity_check:
-        # If somehow called with fixed anchor, it essentially becomes:
         omch2, gamma = params
         H0 = 67.4
     else:
         H0, omch2, gamma = params
         if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
             return 1e10
-    
+
     if not (GAMMA_MIN < gamma < GAMMA_MAX):
         return 1e10
     if not check_physical_prior(H0, omch2):
         return 1e10
 
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        mu_th = mu_th_base + gamma * np.log(1 + z_mu)
-        
-        if COMBINED_MODE:
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-            
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, gamma * np.log(1 + z_mu),
+        H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("gcdm", gamma=gamma),
+    )
 
 
 # =============================================================================
 # EVOLVING γ(z) MODELS
 # =============================================================================
 
-def chi2_gcdm_linear(params):
-    """γCDM-LINEAR: γ(z) = γ₀·(1+z). Includes physical Ωm prior and σ_int."""
+def _unpack_evolving_with_M(params):
+    """Shared unpack for chi2_gcdm_linear / log_squared / log_cubed.
+
+    All three share the same parameter layout ([H0?, omch2, M..., γ₀]) and
+    bounds checks. Returns (ok, H0, omch2, M_sne, M_qso, delta_M, gamma_0)
+    where ok=False indicates a prior violation (caller returns 1e10).
+    """
     if COMBINED_MODE:
         if args.fixed_anchor:
             if args.no_nuisance:
                 omch2, gamma_0 = params
-                M_sne, M_qso = 0.0, 0.0
+                M_sne = M_qso = 0.0
             else:
                 omch2, M_sne, M_qso, gamma_0 = params
             H0 = 67.4
         else:
             H0, omch2, M_sne, M_qso, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX): return 1e10
-            
+            if not (H0_MIN < H0 < H0_MAX):
+                return (False, None, None, None, None, None, None)
         if not args.no_nuisance:
-            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
-        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
-        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
+            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX):
+                return (False, None, None, None, None, None, None)
+        if not (OMCH2_MIN < omch2 < OMCH2_MAX):
+            return (False, None, None, None, None, None, None)
+        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
+            return (False, None, None, None, None, None, None)
+        return (True, H0, omch2, M_sne, M_qso, 0.0, gamma_0)
+
+    if args.fixed_anchor:
+        if args.no_nuisance:
+            omch2, gamma_0 = params
+            delta_M = 0.0
+        else:
+            omch2, delta_M, gamma_0 = params
+        H0 = 67.4
     else:
-        if args.fixed_anchor:
-            if args.no_nuisance:
-                omch2, gamma_0 = params
-                delta_M = 0.0
-            else:
-                omch2, delta_M, gamma_0 = params
-            H0 = 67.4
-        else:
-            H0, omch2, delta_M, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX): return 1e10
-            
-        if not args.no_nuisance:
-            if not (M_MIN < delta_M < M_MAX): return 1e10
-        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
-        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
+        H0, omch2, delta_M, gamma_0 = params
+        if not (H0_MIN < H0 < H0_MAX):
+            return (False, None, None, None, None, None, None)
+    if not args.no_nuisance:
+        if not (M_MIN < delta_M < M_MAX):
+            return (False, None, None, None, None, None, None)
+    if not (OMCH2_MIN < omch2 < OMCH2_MAX):
+        return (False, None, None, None, None, None, None)
+    if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
+        return (False, None, None, None, None, None, None)
+    return (True, H0, omch2, 0.0, 0.0, delta_M, gamma_0)
 
-    if not check_physical_prior(H0, omch2):
+
+def _unpack_evolving_no_M(params):
+    """Shared unpack for chi2_gcdm_{linear,log_squared,log_cubed}_no_M."""
+    if args.fixed_anchor or args.sanity_check:
+        omch2, gamma_0 = params
+        H0 = 67.4
+    else:
+        H0, omch2, gamma_0 = params
+    if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
+        return (False, None, None, None)
+    if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
+        return (False, None, None, None)
+    return (True, H0, omch2, gamma_0)
+
+
+def chi2_gcdm_linear(params):
+    """γCDM-LINEAR: Δμ = γ₀·(1+z)·ln(1+z)."""
+    ok, H0, omch2, M_sne, M_qso, delta_M, gamma_0 = _unpack_evolving_with_M(params)
+    if not ok or not check_physical_prior(H0, omch2):
         return 1e10
-
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        gamma_corr = gamma_0 * (1 + z_mu) * np.log(1 + z_mu)
-
-        if COMBINED_MODE:
-            mu_th = mu_th_base + np.where(sne_mask, M_sne, M_qso) + gamma_corr
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            mu_th = mu_th_base + delta_M + gamma_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, gamma_0 * (1 + z_mu) * np.log(1 + z_mu),
+        M_sne=M_sne, M_qso=M_qso, delta_M=delta_M,
+        use_m_penalty=True, H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("linear", gamma_0=gamma_0),
+    )
 
 
 def chi2_gcdm_log_squared(params):
-    """γCDM-LOG²: Δμ = γ₀·[ln(1+z)]². Includes physical Ωm prior and σ_int."""
-    if COMBINED_MODE:
-        if args.fixed_anchor:
-            if args.no_nuisance:
-                omch2, gamma_0 = params
-                M_sne, M_qso = 0.0, 0.0
-            else:
-                omch2, M_sne, M_qso, gamma_0 = params
-            H0 = 67.4
-        else:
-            H0, omch2, M_sne, M_qso, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX): return 1e10
-            
-        if not args.no_nuisance:
-            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
-        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
-        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
-    else:
-        if args.fixed_anchor:
-            if args.no_nuisance:
-                omch2, gamma_0 = params
-                delta_M = 0.0
-            else:
-                omch2, delta_M, gamma_0 = params
-            H0 = 67.4
-        else:
-            H0, omch2, delta_M, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX): return 1e10
-            
-        if not args.no_nuisance:
-            if not (M_MIN < delta_M < M_MAX): return 1e10
-        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
-        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
-
-    if not check_physical_prior(H0, omch2):
+    """γCDM-LOG²: Δμ = γ₀·[ln(1+z)]²."""
+    ok, H0, omch2, M_sne, M_qso, delta_M, gamma_0 = _unpack_evolving_with_M(params)
+    if not ok or not check_physical_prior(H0, omch2):
         return 1e10
-
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        gamma_corr = gamma_0 * np.log(1 + z_mu) ** 2
-
-        if COMBINED_MODE:
-            mu_th = mu_th_base + np.where(sne_mask, M_sne, M_qso) + gamma_corr
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            mu_th = mu_th_base + delta_M + gamma_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, gamma_0 * np.log(1 + z_mu) ** 2,
+        M_sne=M_sne, M_qso=M_qso, delta_M=delta_M,
+        use_m_penalty=True, H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("log2", gamma_0=gamma_0),
+    )
 
 
 def chi2_gcdm_log_cubed(params):
-    """γCDM-LOG³: Δμ = γ₀·[ln(1+z)]³. Includes physical Ωm prior and σ_int."""
-    if COMBINED_MODE:
-        if args.fixed_anchor:
-            if args.no_nuisance:
-                omch2, gamma_0 = params
-                M_sne, M_qso = 0.0, 0.0
-            else:
-                omch2, M_sne, M_qso, gamma_0 = params
-            H0 = 67.4
-        else:
-            H0, omch2, M_sne, M_qso, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX): return 1e10
-            
-        if not args.no_nuisance:
-            if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
-        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
-        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
-    else:
-        if args.fixed_anchor:
-            if args.no_nuisance:
-                omch2, gamma_0 = params
-                delta_M = 0.0
-            else:
-                omch2, delta_M, gamma_0 = params
-            H0 = 67.4
-        else:
-            H0, omch2, delta_M, gamma_0 = params
-            if not (H0_MIN < H0 < H0_MAX): return 1e10
-            
-        if not args.no_nuisance:
-            if not (M_MIN < delta_M < M_MAX): return 1e10
-        if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
-        if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
-
-    if not check_physical_prior(H0, omch2):
+    """γCDM-LOG³: Δμ = γ₀·[ln(1+z)]³."""
+    ok, H0, omch2, M_sne, M_qso, delta_M, gamma_0 = _unpack_evolving_with_M(params)
+    if not ok or not check_physical_prior(H0, omch2):
         return 1e10
-
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        gamma_corr = gamma_0 * np.log(1 + z_mu) ** 3
-
-        if COMBINED_MODE:
-            mu_th = mu_th_base + np.where(sne_mask, M_sne, M_qso) + gamma_corr
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            mu_th = mu_th_base + delta_M + gamma_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, gamma_0 * np.log(1 + z_mu) ** 3,
+        M_sne=M_sne, M_qso=M_qso, delta_M=delta_M,
+        use_m_penalty=True, H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("log3", gamma_0=gamma_0),
+    )
 
 
 # =============================================================================
@@ -1002,127 +1473,39 @@ def chi2_gcdm_log_cubed(params):
 # =============================================================================
 
 def chi2_gcdm_linear_no_M(params):
-    """γCDM-LINEAR sin δM: 3 params (H₀, Ωch², γ₀). Includes physical Ωm prior and σ_int."""
-    if args.fixed_anchor or args.sanity_check:
-        omch2, gamma_0 = params
-        H0 = 67.4
-    else:
-        H0, omch2, gamma_0 = params
-    if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
+    """γCDM-LINEAR sin δM: 3 params (H₀, Ωch², γ₀)."""
+    ok, H0, omch2, gamma_0 = _unpack_evolving_no_M(params)
+    if not ok or not check_physical_prior(H0, omch2):
         return 1e10
-    if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-        return 1e10
-    if not check_physical_prior(H0, omch2):
-        return 1e10
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        mu_th = mu_th_base + gamma_0 * (1 + z_mu) * np.log(1 + z_mu)
-        
-        if COMBINED_MODE:
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-            
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-        
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-            
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
-
+    return _chi2_tail(
+        H0, omch2, gamma_0 * (1 + z_mu) * np.log(1 + z_mu),
+        H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("linear", gamma_0=gamma_0),
+    )
 
 
 def chi2_gcdm_log_squared_no_M(params):
-    """γCDM-LOG² sin δM: 3 params (H₀, Ωch², γ₀). Includes physical Ωm prior and σ_int."""
-    if args.fixed_anchor or args.sanity_check:
-         omch2, gamma_0 = params
-         H0 = 67.4
-    else:
-        H0, omch2, gamma_0 = params
-    if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
+    """γCDM-LOG² sin δM: 3 params (H₀, Ωch², γ₀)."""
+    ok, H0, omch2, gamma_0 = _unpack_evolving_no_M(params)
+    if not ok or not check_physical_prior(H0, omch2):
         return 1e10
-    if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-        return 1e10
-    if not check_physical_prior(H0, omch2):
-        return 1e10
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        mu_th = mu_th_base + gamma_0 * np.log(1 + z_mu) ** 2
-        
-        if COMBINED_MODE:
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-            
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-        
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-            
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, gamma_0 * np.log(1 + z_mu) ** 2,
+        H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("log2", gamma_0=gamma_0),
+    )
 
 
 def chi2_gcdm_log_cubed_no_M(params):
-    """γCDM-LOG³ sin δM: 3 params (H₀, Ωch², γ₀). Includes physical Ωm prior and σ_int."""
-    if args.fixed_anchor or args.sanity_check:
-         omch2, gamma_0 = params
-         H0 = 67.4
-    else:
-        H0, omch2, gamma_0 = params
-    if not (H0_MIN < H0 < H0_MAX and OMCH2_MIN < omch2 < OMCH2_MAX):
+    """γCDM-LOG³ sin δM: 3 params (H₀, Ωch², γ₀)."""
+    ok, H0, omch2, gamma_0 = _unpack_evolving_no_M(params)
+    if not ok or not check_physical_prior(H0, omch2):
         return 1e10
-    if not (GAMMA_MIN < gamma_0 < GAMMA_MAX):
-        return 1e10
-    if not check_physical_prior(H0, omch2):
-        return 1e10
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        mu_th = mu_th_base + gamma_0 * np.log(1 + z_mu) ** 3
-        
-        if COMBINED_MODE:
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-            
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-        
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-            
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, gamma_0 * np.log(1 + z_mu) ** 3,
+        H0_local=H0,
+        bao_correction_zeff=_bao_corr_if_fit("log3", gamma_0=gamma_0),
+    )
 
 
 
@@ -1131,44 +1514,35 @@ def chi2_gcdm_log_cubed_no_M(params):
 # =============================================================================
 
 def chi2_decay(params):
-    """
-    Decay Model: Δμ = A * exp(-z / zd).
-    H0 FREE (like ΛCDM) for fair comparison. Fits H0, Omch2, A, zd + Nuisance.
-    When --fixed-anchor: H0=67.4, M=0.
-    
-    Returns -2·logL = χ² + Σlog(σ_eff²) for proper Bayesian comparison.
-    """
+    """γCDM-Decay: Δμ = A·exp(-z/zd). H0 free by default."""
     if COMBINED_MODE:
         if args.fixed_anchor:
             if args.no_nuisance:
-                 omch2, A, zd = params
-                 M_sne, M_qso = 0.0, 0.0
-                 H0 = 67.4
+                omch2, A, zd = params
+                M_sne = M_qso = 0.0
             else:
-                 omch2, M_sne, M_qso, A, zd = params
-                 H0 = 67.4
+                omch2, M_sne, M_qso, A, zd = params
+            H0 = 67.4
         elif args.sanity_check:
-            # Sanity Check (Decay): H0=67.4, M REMOVED
             omch2, A, zd = params
             H0, M_sne, M_qso = 67.4, 0.0, 0.0
         else:
             H0, omch2, M_sne, M_qso, A, zd = params
             if args.no_nuisance:
-                M_sne, M_qso = 0.0, 0.0
+                M_sne = M_qso = 0.0
             if not (H0_MIN < H0 < H0_MAX): return 1e10
             if not args.no_nuisance:
                 if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
-        
         if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        delta_M = 0.0
     else:
         if args.fixed_anchor:
             if args.no_nuisance:
                 omch2, A, zd = params
                 delta_M = 0.0
-                H0 = 67.4
             else:
                 omch2, delta_M, A, zd = params
-                H0 = 67.4
+            H0 = 67.4
         elif args.sanity_check:
             omch2, A, zd = params
             H0, delta_M = 67.4, 0.0
@@ -1178,9 +1552,9 @@ def chi2_decay(params):
                 delta_M = 0.0
             if not (H0_MIN < H0 < H0_MAX): return 1e10
             if not args.no_nuisance:
-                 if not (M_MIN < delta_M < M_MAX): return 1e10
-        
+                if not (M_MIN < delta_M < M_MAX): return 1e10
         if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        M_sne = M_qso = 0.0
 
     if not (A_MIN < A < A_MAX and ZD_MIN < zd < ZD_MAX):
         return 1e10
@@ -1188,88 +1562,34 @@ def chi2_decay(params):
     if not check_physical_prior(H0, omch2):
         return 1e10
 
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        decay_corr = A * np.exp(-z_mu / zd)
-
-        if COMBINED_MODE:
-            mu_th = mu_th_base + np.where(sne_mask, M_sne, M_qso) + decay_corr
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            mu_th = mu_th_base + delta_M + decay_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, A * np.exp(-z_mu / zd),
+        M_sne=M_sne, M_qso=M_qso, delta_M=delta_M,
+        use_m_penalty=True,
+        H0_local=h0_local(H0, A=A, z_b=zd, z_pivot=Z_PIVOT),
+        bao_correction_zeff=_bao_corr_if_fit("decay", A=A, zd=zd),
+    )
 
 
 def chi2_decay_no_M(params):
-    """
-    Decay Model (NO M): Δμ = A * exp(-z / zd).
-    """
-    # Unpack based on flags
+    """γCDM-Decay sin M: Δμ = A·exp(-z/zd)."""
     if args.fixed_anchor or args.sanity_check:
-         # Fixed Anchor: H0 is fixed to 67.4.
-         # params: [omch2, A, zd]
-         omch2, A, zd = params
-         H0 = 67.4
+        omch2, A, zd = params
+        H0 = 67.4
     else:
-         # Asymmetric (Free H0): H0 is free.
-         # params: [H0, omch2, A, zd]
-         H0, omch2, A, zd = params
-         if not (H0_MIN < H0 < H0_MAX):
-             return 1e10
-
-    # Global Bounds Checks
+        H0, omch2, A, zd = params
+        if not (H0_MIN < H0 < H0_MAX):
+            return 1e10
     if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
     if not (A_MIN < A < A_MAX and ZD_MIN < zd < ZD_MAX): return 1e10
-    
     if not check_physical_prior(H0, omch2):
         return 1e10
 
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        decay_corr = A * np.exp(-z_mu / zd)
-        mu_th = mu_th_base + decay_corr
-        
-        if COMBINED_MODE:
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-            
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-        
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-            
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, A * np.exp(-z_mu / zd),
+        H0_local=h0_local(H0, A=A, z_b=zd, z_pivot=Z_PIVOT),
+        bao_correction_zeff=_bao_corr_if_fit("decay", A=A, zd=zd),
+    )
 
 
 # =============================================================================
@@ -1277,153 +1597,247 @@ def chi2_decay_no_M(params):
 # =============================================================================
 
 def chi2_gcdm_log_decay(params):
-    """
-    γCDM-LOG²-DECAY: Δμ = A·exp(-z/z_b) + γ₀·[ln(1+z)]²·exp(-z/z_h).
-    Two-component additive model: local bubble (SH0ES) + Kerr geometry (quasars).
-    H0 FREE for fair comparison. Fits H0, Omch2, A, z_b, gamma_0, z_h + Nuisance.
-    """
+    """γCDM-LOG²-DECAY with optional --fit-scatter, --cmb, --no-bubble."""
+    params = list(params)
+    _sig_sne, _sig_qso, _ok = _extract_fit_scatter(params, supported=True)
+    if not _ok:
+        return 1e10
+
+    # --no-bubble suppresses the A·exp(-z/z_b) term entirely: neither A nor
+    # z_b appear in the parameter vector; we set A=0 and z_b=1 (any non-zero
+    # placeholder) so the correction evaluates to 0 and bounds are skipped.
+    _use_bubble = not args.no_bubble
+
     if COMBINED_MODE:
         if args.fixed_anchor:
             if args.no_nuisance:
-                omch2, A, z_b, gamma_0, z_h = params
-                M_sne, M_qso = 0.0, 0.0
+                if _use_bubble:
+                    omch2, A, z_b, gamma_0, z_h = params[0:5]
+                else:
+                    omch2, gamma_0, z_h = params[0:3]
+                    A, z_b = 0.0, 1.0
+                M_sne = M_qso = 0.0
             else:
-                omch2, M_sne, M_qso, A, z_b, gamma_0, z_h = params
+                if _use_bubble:
+                    omch2, M_sne, M_qso, A, z_b, gamma_0, z_h = params
+                else:
+                    omch2, M_sne, M_qso, gamma_0, z_h = params
+                    A, z_b = 0.0, 1.0
             H0 = 67.4
         elif args.sanity_check:
-            omch2, A, z_b, gamma_0, z_h = params
+            if _use_bubble:
+                omch2, A, z_b, gamma_0, z_h = params[0:5]
+            else:
+                omch2, gamma_0, z_h = params[0:3]
+                A, z_b = 0.0, 1.0
             H0, M_sne, M_qso = 67.4, 0.0, 0.0
         else:
-            H0, omch2, M_sne, M_qso, A, z_b, gamma_0, z_h = params
+            if _use_bubble:
+                H0, omch2, M_sne, M_qso, A, z_b, gamma_0, z_h = params
+            else:
+                H0, omch2, M_sne, M_qso, gamma_0, z_h = params
+                A, z_b = 0.0, 1.0
             if args.no_nuisance:
-                M_sne, M_qso = 0.0, 0.0
+                M_sne = M_qso = 0.0
             if not (H0_MIN < H0 < H0_MAX): return 1e10
             if not args.no_nuisance:
                 if not (M_MIN < M_sne < M_MAX and M_MIN < M_qso < M_MAX): return 1e10
-        
         if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        delta_M = 0.0
     else:
         if args.fixed_anchor:
             if args.no_nuisance:
-                omch2, A, z_b, gamma_0, z_h = params
+                if _use_bubble:
+                    omch2, A, z_b, gamma_0, z_h = params[0:5]
+                else:
+                    omch2, gamma_0, z_h = params[0:3]
+                    A, z_b = 0.0, 1.0
                 delta_M = 0.0
-                H0 = 67.4
             else:
-                omch2, delta_M, A, z_b, gamma_0, z_h = params
-                H0 = 67.4
+                if _use_bubble:
+                    omch2, delta_M, A, z_b, gamma_0, z_h = params
+                else:
+                    omch2, delta_M, gamma_0, z_h = params
+                    A, z_b = 0.0, 1.0
+            H0 = 67.4
         elif args.sanity_check:
-            omch2, A, z_b, gamma_0, z_h = params
+            if _use_bubble:
+                omch2, A, z_b, gamma_0, z_h = params[0:5]
+            else:
+                omch2, gamma_0, z_h = params[0:3]
+                A, z_b = 0.0, 1.0
             H0, delta_M = 67.4, 0.0
         else:
-            H0, omch2, delta_M, A, z_b, gamma_0, z_h = params
+            if _use_bubble:
+                H0, omch2, delta_M, A, z_b, gamma_0, z_h = params
+            else:
+                H0, omch2, delta_M, gamma_0, z_h = params
+                A, z_b = 0.0, 1.0
             if args.no_nuisance:
                 delta_M = 0.0
             if not (H0_MIN < H0 < H0_MAX): return 1e10
             if not args.no_nuisance:
-                 if not (M_MIN < delta_M < M_MAX): return 1e10
-        
+                if not (M_MIN < delta_M < M_MAX): return 1e10
         if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
+        M_sne = M_qso = 0.0
 
-    # Unified model bounds: A, z_b (bubble), gamma_0 (Kerr), z_h (horizon)
-    if not (A_MIN < A < A_MAX): return 1e10
-    if not (ZB_MIN < z_b < ZB_MAX): return 1e10
+    if _use_bubble:
+        if not (A_MIN < A < A_MAX): return 1e10
+        if not (ZB_MIN < z_b < ZB_MAX): return 1e10
     if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
     if not (ZH_MIN < z_h < ZH_MAX): return 1e10
 
     if not check_physical_prior(H0, omch2):
         return 1e10
 
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
+    # Two-component additive correction in redshift space.
+    bubble_term = (A * np.exp(-z_mu / z_b)) if _use_bubble else 0.0
+    kerr_term = gamma_0 * np.log(1 + z_mu) ** 2 * np.exp(-z_mu / z_h)
+    unified_corr = bubble_term + kerr_term
 
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        # ── THE LOG²-DECAY FORMULA (Two-component additive) ──
-        bubble_term = A * np.exp(-z_mu / z_b)                         # Local SH0ES effect
-        kerr_term = gamma_0 * np.log(1 + z_mu)**2 * np.exp(-z_mu / z_h)  # Kerr geometry
-        unified_corr = bubble_term + kerr_term
+    # Same model evaluated at z* for the CMB shift-parameter penalty.
+    bubble_star = (A * np.exp(-Z_STAR / z_b)) if _use_bubble else 0.0
+    delta_mu_star = bubble_star + gamma_0 * np.log(1 + Z_STAR) ** 2 * np.exp(-Z_STAR / z_h)
 
-        if COMBINED_MODE:
-            mu_th = mu_th_base + np.where(sne_mask, M_sne, M_qso) + unified_corr
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            mu_th = mu_th_base + delta_M + unified_corr
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
+    H0_loc = H0 if not _use_bubble else h0_local(H0, A=A, z_b=z_b, z_pivot=Z_PIVOT)
 
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
+    # For BAO: same two-component formula at DESI z_eff (with bubble gated by _use_bubble).
+    _A_bao = A if _use_bubble else 0.0
+    _zb_bao = z_b if _use_bubble else 1.0    # placeholder, bubble_term == 0 anyway
 
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    return _chi2_tail(
+        H0, omch2, unified_corr,
+        M_sne=M_sne, M_qso=M_qso, delta_M=delta_M,
+        sig_sne=_sig_sne, sig_qso=_sig_qso,
+        use_cmb=True, delta_mu_star=delta_mu_star,
+        use_m_penalty=True,
+        H0_local=H0_loc,
+        bao_correction_zeff=_bao_corr_if_fit(
+            "log_decay", A=_A_bao, z_b=_zb_bao, gamma_0=gamma_0, z_h=z_h
+        ),
+    )
 
 
 def chi2_gcdm_log_decay_no_M(params):
-    """
-    γCDM-LOG²-DECAY (NO M): Δμ = A·exp(-z/z_b) + γ₀·[ln(1+z)]²·exp(-z/z_h).
-    """
-    # Unpack based on flags
+    """γCDM-LOG²-DECAY sin M: Δμ = A·exp(-z/z_b) + γ₀·[ln(1+z)]²·exp(-z/z_h)."""
     if args.fixed_anchor or args.sanity_check:
-         # Fixed Anchor: H0 is fixed to 67.4.
-         # params: [omch2, A, z_b, gamma_0, z_h]
-         omch2, A, z_b, gamma_0, z_h = params
-         H0 = 67.4
+        omch2, A, z_b, gamma_0, z_h = params
+        H0 = 67.4
     else:
-         # Asymmetric (Free H0): H0 is free.
-         # params: [H0, omch2, A, z_b, gamma_0, z_h]
-         H0, omch2, A, z_b, gamma_0, z_h = params
-         if not (H0_MIN < H0 < H0_MAX):
-             return 1e10
+        H0, omch2, A, z_b, gamma_0, z_h = params
+        if not (H0_MIN < H0 < H0_MAX):
+            return 1e10
 
-    # Global Bounds Checks
     if not (OMCH2_MIN < omch2 < OMCH2_MAX): return 1e10
     if not (A_MIN < A < A_MAX): return 1e10
     if not (ZB_MIN < z_b < ZB_MAX): return 1e10
     if not (GAMMA_MIN < gamma_0 < GAMMA_MAX): return 1e10
     if not (ZH_MIN < z_h < ZH_MAX): return 1e10
-    
+
     if not check_physical_prior(H0, omch2):
         return 1e10
 
-    try:
-        pars = camb.CAMBparams()
-        pars.WantTransfer = False
-        pars.WantCls = False
-        pars.set_cosmology(H0=H0, ombh2=0.0224, omch2=omch2)
-        r = camb.get_background(pars)
-        mu_th_base = 5 * np.log10(np.maximum(r.luminosity_distance(z_mu), 1e-10)) + 25
-        
-        # ── THE LOG²-DECAY FORMULA (Two-component additive) ──
-        bubble_term = A * np.exp(-z_mu / z_b)
-        kerr_term = gamma_0 * np.log(1 + z_mu)**2 * np.exp(-z_mu / z_h)
-        mu_th = mu_th_base + bubble_term + kerr_term
-        
-        if COMBINED_MODE:
-            sigma_int = np.where(sne_mask, SIGMA_INT_SNE, SIGMA_INT_QSO)
-            err_eff = np.sqrt(err_mu**2 + sigma_int**2)
-        else:
-            err_eff = np.sqrt(err_mu**2 + SIGMA_INT_SINGLE**2)
-            
-        neg2logL_mu = _neg2logL_mu(mu_obs - mu_th, err_eff)
-        
-        if len(z_cc) > 0:
-            chi2_cc = np.sum(((H_obs - r.hubble_parameter(z_cc)) / err_cc) ** 2)
-            norm_cc = np.sum(np.log(err_cc**2))
-        else:
-            chi2_cc, norm_cc = 0, 0
-            
-        return neg2logL_mu + chi2_cc + norm_cc
-    except Exception:
-        return 1e10
+    corr = A * np.exp(-z_mu / z_b) + gamma_0 * np.log(1 + z_mu) ** 2 * np.exp(-z_mu / z_h)
+
+    # NOTE: the _no_M variant intentionally does NOT apply the CMB shift
+    # penalty (this mirrors the original pre-refactor behavior; see
+    # regression test for the bit-exact equivalence).
+    return _chi2_tail(
+        H0, omch2, corr,
+        H0_local=h0_local(H0, A=A, z_b=z_b, z_pivot=Z_PIVOT),
+        bao_correction_zeff=_bao_corr_if_fit(
+            "log_decay", A=A, z_b=z_b, gamma_0=gamma_0, z_h=z_h
+        ),
+    )
+
+
+# ============================================================================
+# REGRESSION HOOK — --snapshot-chi2 PATH
+# ----------------------------------------------------------------------------
+# This block runs BEFORE the MLE loop. Its sole job is to freeze the current
+# χ² surface for a fixed set of parameter vectors that exercises all 12
+# chi2_* functions. The snapshot is used as a before/after baseline around
+# the Stage 4b refactor (ModelSpec). If refactored code produces |Δχ²| > 1e-6
+# for ANY entry, the refactor is numerically not bit-compatible and must be
+# debugged.
+# ============================================================================
+if args.snapshot_chi2 is not None:
+    import json as _json
+    import sys as _sys
+    # Fixed reference vectors, covering all chi2_* signatures.
+    # The values are arbitrary but deliberately bracket physical regions.
+    _REF_VECTORS_NO_M = {
+        "chi2_lcdm_no_M":              [67.4, 0.120],
+        "chi2_gcdm_no_M":              [67.4, 0.120, 0.100],
+        "chi2_gcdm_linear_no_M":       [67.4, 0.120, 0.050],
+        "chi2_gcdm_log_squared_no_M":  [67.4, 0.120, 0.100],
+        "chi2_gcdm_log_cubed_no_M":    [67.4, 0.120, 0.080],
+        "chi2_decay_no_M":             [67.4, 0.120, -0.150, 0.400],
+        "chi2_gcdm_log_decay_no_M":    [67.4, 0.120, -0.150, 0.400, 0.250, 8.000],
+    }
+    # The "with-M" variants depend on COMBINED_MODE, so we adapt. In single
+    # mode δM is one extra scalar; in combined mode (default) M_sne and
+    # M_qso are two extras.
+    if COMBINED_MODE:
+        _M_PADS = [0.010, 0.050]            # [M_sne, M_qso]
+    else:
+        _M_PADS = [0.030]                   # [delta_M]
+    _REF_VECTORS_WITH_M = {
+        "chi2_lcdm":             [67.4, 0.120] + _M_PADS,
+        "chi2_gcdm":             [67.4, 0.120] + _M_PADS + [0.100],
+        "chi2_gcdm_linear":      [67.4, 0.120] + _M_PADS + [0.050],
+        "chi2_gcdm_log_squared": [67.4, 0.120] + _M_PADS + [0.100],
+        "chi2_gcdm_log_cubed":   [67.4, 0.120] + _M_PADS + [0.080],
+        "chi2_decay":            [67.4, 0.120] + _M_PADS + [-0.150, 0.400],
+        "chi2_gcdm_log_decay":   [67.4, 0.120] + _M_PADS + [-0.150, 0.400, 0.250, 8.000],
+    }
+    _fn_map = {
+        "chi2_lcdm": chi2_lcdm,
+        "chi2_gcdm": chi2_gcdm,
+        "chi2_gcdm_linear": chi2_gcdm_linear,
+        "chi2_gcdm_log_squared": chi2_gcdm_log_squared,
+        "chi2_gcdm_log_cubed": chi2_gcdm_log_cubed,
+        "chi2_decay": chi2_decay,
+        "chi2_gcdm_log_decay": chi2_gcdm_log_decay,
+        "chi2_lcdm_no_M": chi2_lcdm_no_M,
+        "chi2_gcdm_no_M": chi2_gcdm_no_M,
+        "chi2_gcdm_linear_no_M": chi2_gcdm_linear_no_M,
+        "chi2_gcdm_log_squared_no_M": chi2_gcdm_log_squared_no_M,
+        "chi2_gcdm_log_cubed_no_M": chi2_gcdm_log_cubed_no_M,
+        "chi2_decay_no_M": chi2_decay_no_M,
+        "chi2_gcdm_log_decay_no_M": chi2_gcdm_log_decay_no_M,
+    }
+    _snapshot = {
+        "args": {k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v))
+                 for k, v in vars(args).items() if k != "snapshot_chi2"},
+        "combined_mode": bool(COMBINED_MODE),
+        "dataset_shape": {
+            "N_mu": int(len(z_mu)),
+            "N_sne": int(np.sum(sne_mask)) if sne_mask is not None else None,
+            "N_qso": int(np.sum(~sne_mask)) if sne_mask is not None else None,
+            "N_cc": int(len(z_cc)),
+        },
+        "snapshots": {},
+    }
+    _all_vectors = {**_REF_VECTORS_NO_M, **_REF_VECTORS_WITH_M}
+    for _name, _params in _all_vectors.items():
+        _fn = _fn_map[_name]
+        try:
+            _val = float(_fn(_params))
+        except Exception as _e:                                # noqa: BLE001
+            _val = None
+            _snapshot["snapshots"][_name] = {
+                "params": list(_params), "value": None, "error": str(_e)[:200]
+            }
+            continue
+        _snapshot["snapshots"][_name] = {"params": list(_params), "value": _val}
+        print(f"   [snapshot] {_name:<32s} -> χ² = {_val:.6f}")
+    _out = os.path.abspath(args.snapshot_chi2)
+    with open(_out, "w") as _fh:
+        _json.dump(_snapshot, _fh, indent=2)
+    print(f"\n✓ χ² snapshot with {len(_all_vectors)} entries written to {_out}")
+    print("  Rerun with the same args after the refactor and diff with test_regression.py.")
+    _sys.exit(0)
 
 
 # ============================================================================
@@ -1437,40 +1851,37 @@ print(f"🎲 {args.starts} random starts per model...")
 
 # Define models to fit
 # Name, Chi2 Function, N_params (base), Evolving Function (if applicable)
+# "corr_kind" is used by the BAO null test to reconstruct Δμ(z) at DESI z_eff
+# from the best-fit params, independent of the "type" which is used for the
+# shared fitting pipeline (bounds, parameter layout).
 models_to_fit = [
-    {"name": "ΛCDM", "fn": chi2_lcdm, "type": "lcdm"},
-    # {"name": "γCDM (const)", "fn": chi2_gcdm, "type": "gcdm"},
-    # {"name": "γCDM-LINEAL", "fn": chi2_gcdm_linear, "type": "evolving"},
-    # {"name": "γCDM-LOG²", "fn": chi2_gcdm_log_squared, "type": "evolving"},
-    # {"name": "γCDM-LOG³", "fn": chi2_gcdm_log_cubed, "type": "evolving"},
-
+    {"name": "ΛCDM", "fn": chi2_lcdm, "type": "lcdm", "corr_kind": "lcdm"},
 ]
 models_to_fit += [
-    {"name": "γCDM-LOG²", "fn": chi2_gcdm_log_squared, "type": "evolving"},
-    {"name": "γCDM-Decay", "fn": chi2_decay, "type": "decay"},
-    {"name": "γCDM-LOG²-Decay", "fn": chi2_gcdm_log_decay, "type": "log_decay"},
+    {"name": "γCDM-LOG²", "fn": chi2_gcdm_log_squared, "type": "evolving", "corr_kind": "log2"},
+    {"name": "γCDM-Decay", "fn": chi2_decay, "type": "decay", "corr_kind": "decay"},
+    {"name": "γCDM-LOG²-Decay", "fn": chi2_gcdm_log_decay, "type": "log_decay", "corr_kind": "log_decay"},
 ]
 # Legacy models: only include with --legacy flag
 if args.legacy:
     models_to_fit += [
-        {"name": "γCDM-LINEAL", "fn": chi2_gcdm_linear, "type": "evolving"},
-        {"name": "γCDM-LOG³", "fn": chi2_gcdm_log_cubed, "type": "evolving"},
+        {"name": "γCDM-LINEAL", "fn": chi2_gcdm_linear, "type": "evolving", "corr_kind": "linear"},
+        {"name": "γCDM-LOG³", "fn": chi2_gcdm_log_cubed, "type": "evolving", "corr_kind": "log3"},
     ]
 
 if args.asymmetric or args.sanity_check:
     # Use no-M variants: ΛCDM keeps M, γCDM/Decay lose M entirely
-    # Index 0 is LCDM (untouched in asymmetric, touched in sanity but handled by bounds)
-    # Start mainly from index 1 (My Models)
-    
-    # models_to_fit[1]["fn"] = chi2_gcdm_no_M # (Const commented out)
-    models_to_fit[1]["fn"] = chi2_gcdm_log_squared_no_M
-    models_to_fit[2]["fn"] = chi2_decay_no_M
-    models_to_fit[3]["fn"] = chi2_gcdm_log_decay_no_M
-
-    # Legacy models: only include with --legacy flag
-    if args.legacy:
-        models_to_fit[4]["fn"] = chi2_gcdm_linear_no_M
-        models_to_fit[5]["fn"] = chi2_gcdm_log_cubed_no_M
+    for m in models_to_fit:
+        if m["name"] == "γCDM-LINEAL":
+            m["fn"] = chi2_gcdm_linear_no_M
+        elif m["name"] == "γCDM-LOG²":
+            m["fn"] = chi2_gcdm_log_squared_no_M
+        elif m["name"] == "γCDM-LOG³":
+            m["fn"] = chi2_gcdm_log_cubed_no_M
+        elif m["name"] == "γCDM-Decay":
+            m["fn"] = chi2_decay_no_M
+        elif m["name"] == "γCDM-LOG²-Decay":
+            m["fn"] = chi2_gcdm_log_decay_no_M
 
 results = []
 best_overall_bic = np.inf
@@ -1482,20 +1893,17 @@ for model in models_to_fit:
     name = model["name"]
     fn = model["fn"]
     mtype = model["type"]
+    corr_kind = model.get("corr_kind", "lcdm")
     
     print(f"\n   Fitting {name}...")
     
     # Determine parameters and bounds
     if mtype == "lcdm":
         if args.fixed_anchor or args.sanity_check:
-            # Fixed Anchor / Sanity Check: H0=67.4, M FREE (ALWAYS)
-            # We ignore no_nuisance for LCDM to allow fair comparison (as requested)
-            n_params = 3 if COMBINED_MODE else 2 # [omch2, M...]
+            n_params = 3 if COMBINED_MODE else 2
             bounds = [(OMCH2_MIN, OMCH2_MAX)] + [(M_MIN, M_MAX)] * (n_params - 1)
         else:
-            # All free
             n_params = 4 if COMBINED_MODE else 3
-            # We ignore no_nuisance for LCDM to allow fair comparison
             bounds = [(H0_MIN, H0_MAX), (OMCH2_MIN, OMCH2_MAX)] + [(M_MIN, M_MAX)] * (n_params - 2)
     elif mtype in ["gcdm", "evolving"]: # "evolving" covers lineal, log2, log3
          # For these models: 
@@ -1553,52 +1961,215 @@ for model in models_to_fit:
                  bounds = [(H0_MIN, H0_MAX), (OMCH2_MIN, OMCH2_MAX)] + [(M_MIN, M_MAX)] * (n_params - 4) + [(A_MIN, A_MAX), (ZD_MIN, ZD_MAX)]
 
     elif mtype == "log_decay":
-        # Unified model: 4 model params (A, z_b, gamma_0, z_h)
+        # --no-bubble: only 2 model params (gamma_0, z_h) instead of 4 (A, z_b, gamma_0, z_h)
+        if args.no_bubble:
+            _model_bounds = [(GAMMA_MIN, GAMMA_MAX), (ZH_MIN, ZH_MAX)]
+        else:
+            _model_bounds = [(A_MIN, A_MAX), (ZB_MIN, ZB_MAX), (GAMMA_MIN, GAMMA_MAX), (ZH_MIN, ZH_MAX)]
+        _n_model = len(_model_bounds)
         if args.sanity_check or args.asymmetric:
              if args.fixed_anchor or args.sanity_check:
-                 n_params = 5 # [omch2, A, z_b, gamma_0, z_h]
-                 bounds = [(OMCH2_MIN, OMCH2_MAX), (A_MIN, A_MAX), (ZB_MIN, ZB_MAX), (GAMMA_MIN, GAMMA_MAX), (ZH_MIN, ZH_MAX)]
+                 n_params = 1 + _n_model # [omch2, *model]
+                 bounds = [(OMCH2_MIN, OMCH2_MAX)] + _model_bounds
              else:
-                 n_params = 6 # [H0, omch2, A, z_b, gamma_0, z_h]
-                 bounds = [(H0_MIN, H0_MAX), (OMCH2_MIN, OMCH2_MAX), (A_MIN, A_MAX), (ZB_MIN, ZB_MAX), (GAMMA_MIN, GAMMA_MAX), (ZH_MIN, ZH_MAX)]
+                 n_params = 2 + _n_model # [H0, omch2, *model]
+                 bounds = [(H0_MIN, H0_MAX), (OMCH2_MIN, OMCH2_MAX)] + _model_bounds
                  
         elif args.fixed_anchor:
              if args.no_nuisance:
-                 n_params = 5 # [omch2, A, z_b, gamma_0, z_h]
-                 bounds = [(OMCH2_MIN, OMCH2_MAX), (A_MIN, A_MAX), (ZB_MIN, ZB_MAX), (GAMMA_MIN, GAMMA_MAX), (ZH_MIN, ZH_MAX)]
+                 n_params = 1 + _n_model
+                 bounds = [(OMCH2_MIN, OMCH2_MAX)] + _model_bounds
              else:
-                 n_params = 7 if COMBINED_MODE else 6 # [omch2, M..., A, z_b, gamma_0, z_h]
-                 bounds = [(OMCH2_MIN, OMCH2_MAX)] + [(M_MIN, M_MAX)] * (n_params - 5) + [(A_MIN, A_MAX), (ZB_MIN, ZB_MAX), (GAMMA_MIN, GAMMA_MAX), (ZH_MIN, ZH_MAX)]
+                 _n_m = 2 if COMBINED_MODE else 1
+                 n_params = 1 + _n_m + _n_model
+                 bounds = [(OMCH2_MIN, OMCH2_MAX)] + [(M_MIN, M_MAX)] * _n_m + _model_bounds
         else:
-            n_params = 8 if COMBINED_MODE else 7
+            _n_m = 2 if COMBINED_MODE else 1
+            n_params = 2 + _n_m + _n_model
             if args.no_nuisance:
-                 bounds = [(H0_MIN, H0_MAX), (OMCH2_MIN, OMCH2_MAX)] + [(0, 0)] * (n_params - 6) + [(A_MIN, A_MAX), (ZB_MIN, ZB_MAX), (GAMMA_MIN, GAMMA_MAX), (ZH_MIN, ZH_MAX)]
+                 bounds = [(H0_MIN, H0_MAX), (OMCH2_MIN, OMCH2_MAX)] + [(0, 0)] * _n_m + _model_bounds
             else:
-                 bounds = [(H0_MIN, H0_MAX), (OMCH2_MIN, OMCH2_MAX)] + [(M_MIN, M_MAX)] * (n_params - 6) + [(A_MIN, A_MAX), (ZB_MIN, ZB_MAX), (GAMMA_MIN, GAMMA_MAX), (ZH_MIN, ZH_MAX)]
+                 bounds = [(H0_MIN, H0_MAX), (OMCH2_MIN, OMCH2_MAX)] + [(M_MIN, M_MAX)] * _n_m + _model_bounds
             
+    # Append scatter bounds at end if fitting
+    _n_scatter = 0
+    if FIT_SCATTER and mtype in ("lcdm", "log_decay"):
+        if COMBINED_MODE:
+            bounds += [(SINT_SNE_MIN, SINT_SNE_MAX), (SINT_QSO_MIN, SINT_QSO_MAX)]
+            _n_scatter = 2
+        else:
+            bounds += [(SINT_SNE_MIN, SINT_SNE_MAX)]
+            _n_scatter = 1
+        n_params += _n_scatter
+
     best_chi2 = np.inf
     best_params = None
 
-    for i in range(args.starts):
-        x0 = [np.random.uniform(b[0], b[1]) for b in bounds]
+    if USE_EVO:
+        # ── EVO BLINDAJE: Ensemble DE + Dual Annealing + Multi-Polish ──
+        _ndim = len(bounds)
+        print(f"      🧬 DIFFERENTIAL EVO: space {_ndim}D, model '{mtype}'")
+
+        # Log-transform dimensions with huge dynamic range (ratio > 1e3)
+        # so DE samples uniformly in log-space instead of wasting population
+        evo_bounds = list(bounds)
+        _log_dims = []
+        for _bi, (_lo, _hi) in enumerate(evo_bounds):
+            if _lo > 0 and _hi / _lo > 1e3:
+                evo_bounds[_bi] = (np.log10(_lo), np.log10(_hi))
+                _log_dims.append(_bi)
+
+        if _log_dims:
+            print(f"      📐 Log-transform en dims {_log_dims} (ratio > 1e3)")
+            _fn_real = fn
+            _log_dims_frozen = list(_log_dims)
+            def _make_fn_evo(_fn_inner, _dims):
+                def fn_evo(x):
+                    x_r = np.array(x, dtype=float)
+                    for _d in _dims:
+                        x_r[_d] = 10.0 ** x_r[_d]
+                    return _fn_inner(x_r)
+                return fn_evo
+            fn_evo = _make_fn_evo(_fn_real, _log_dims_frozen)
+        else:
+            fn_evo = fn
+
+        # Phase 1: Ensemble Differential Evolution (multiple seeds + strategies)
+        _evo_strategies = ['best1bin', 'rand1bin', 'currenttobest1bin',
+                           'best2bin', 'rand2bin']
+        _N_EVO_RUNS = 5
+        _all_candidates = []
+
+        for _irun in range(_N_EVO_RUNS):
+            _strat = _evo_strategies[_irun % len(_evo_strategies)]
+            _seed_i = 42 + _irun * 137
+            print(f"      🎲 DE run {_irun+1}/{_N_EVO_RUNS}"
+                  f" (strategy={_strat}, seed={_seed_i})...", end="")
+            try:
+                _res_de = differential_evolution(
+                    fn_evo, evo_bounds,
+                    seed=_seed_i,
+                    maxiter=2000,
+                    tol=1e-10,
+                    polish=False,
+                    strategy=_strat,
+                    popsize=25,
+                    mutation=(0.5, 1.5),
+                    recombination=0.9,
+                    workers=1,
+                )
+                _all_candidates.append((_res_de.fun, np.array(_res_de.x)))
+                print(f" -2lnL = {_res_de.fun:.2f}")
+            except Exception:
+                print(" [falló]")
+
+        # Phase 2: Dual Annealing (independent global search as cross-check)
+        print(f"      🔥 Dual annealing cross-validation...", end="")
         try:
-            res = minimize(fn, x0, method='Nelder-Mead', options={'maxiter': 5000, 'xatol': 1e-6})
-            if res.fun < best_chi2:
-                best_chi2 = res.fun
-                best_params = res.x
-                # print(f"      Start {i+1}: -2lnL = {res.fun:.1f}") # Optional verbosity
-        except:
-            pass
+            _res_da = dual_annealing(fn_evo, evo_bounds, seed=123, maxiter=1000)
+            _all_candidates.append((_res_da.fun, np.array(_res_da.x)))
+            print(f" -2lnL = {_res_da.fun:.2f}")
+        except Exception:
+            print(" [falló]")
+
+        # Phase 3: Multi-polish — refine top-K candidates with NM + Powell
+        if _all_candidates:
+            _all_candidates.sort(key=lambda t: t[0])
+            _top_k = min(5, len(_all_candidates))
+            print(f"      💎 Multi-polish: top {_top_k} candidatos (NM + Powell)...")
+
+            for _ic in range(_top_k):
+                _cand_chi2, _cand_x = _all_candidates[_ic]
+                for _method, _opts in [
+                    ('Nelder-Mead', {'maxiter': 20000, 'xatol': 1e-10, 'fatol': 1e-10}),
+                    ('Powell', {'maxiter': 20000, 'ftol': 1e-12}),
+                ]:
+                    try:
+                        _res_p = minimize(fn_evo, _cand_x, method=_method, options=_opts)
+                        if _res_p.fun < best_chi2:
+                            best_chi2 = _res_p.fun
+                            best_params = np.array(_res_p.x)
+                    except Exception:
+                        pass
+
+            # Phase 4: Perturbation robustness test around best solution
+            if best_params is not None:
+                print(f"      🔄 Perturbation test (20 runs)...", end="")
+                _n_improved = 0
+                for _ in range(20):
+                    _x_pert = best_params.copy()
+                    for _j, (_lo, _hi) in enumerate(evo_bounds):
+                        _x_pert[_j] += np.random.uniform(-1, 1) * 0.05 * (_hi - _lo)
+                        _x_pert[_j] = np.clip(_x_pert[_j], _lo, _hi)
+                    try:
+                        _res_pt = minimize(fn_evo, _x_pert, method='Nelder-Mead',
+                                           options={'maxiter': 10000,
+                                                    'xatol': 1e-10, 'fatol': 1e-10})
+                        if _res_pt.fun < best_chi2:
+                            best_chi2 = _res_pt.fun
+                            best_params = np.array(_res_pt.x)
+                            _n_improved += 1
+                    except Exception:
+                        pass
+                if _n_improved:
+                    print(f" ⚠️ mejoró {_n_improved}/20 → mínimo inestable")
+                else:
+                    print(f" ✅ estable (0/20 mejoras)")
+
+        # Transform back from log-space to physical parameters
+        if _log_dims and best_params is not None:
+            best_params = np.array(best_params, dtype=float)
+            for _d in _log_dims:
+                best_params[_d] = 10.0 ** best_params[_d]
+
+    else:
+        for i in range(args.starts):
+            x0 = [np.random.uniform(b[0], b[1]) for b in bounds]
+            print(f"      🎲 Inicializando random start {i+1}/{args.starts}: {[round(x, 4) for x in x0]}", end="", flush=True)
+            try:
+                res = minimize(fn, x0, method='Nelder-Mead', options={'maxiter': 20000, 'maxfev': 20000, 'xatol': 1e-8, 'fatol': 1e-8})
+                fn(res.x) # Sync tracker with best fit of this run
+                print(f" -> -2lnL = {res.fun:.2f} (χ²={GLOBAL_CHI2:.2f})")
+                if res.fun < best_chi2:
+                    best_chi2 = res.fun
+                    best_params = res.x
+                    best_chi2_val = GLOBAL_CHI2
+            except:
+                print(" -> Falló")
             
     if best_params is not None:
-        print(f"      ✅ Best -2lnL = {best_chi2:.1f}")
+        if args.camb_tab:
+            print(f"      ✨ Pulido final analítico con CAMB exacto para recuperar precisión canónica...")
+            _tab_state = args.camb_tab
+            args.camb_tab = False
+            try:
+                res_polish = minimize(fn, best_params, method='Nelder-Mead', options={'maxiter': 2000, 'xatol': 1e-8, 'fatol': 1e-8})
+                if res_polish.fun <= best_chi2:
+                    best_chi2 = res_polish.fun
+                    best_params = res_polish.x
+                    fn(best_params) # Sync tracker with best best fit
+                    best_chi2_val = GLOBAL_CHI2
+            except Exception:
+                pass
+            finally:
+                args.camb_tab = _tab_state
+
+        print(f"      ✅ Best -2lnL = {best_chi2:.1f} (χ²={best_chi2_val:.1f})")
         
-        # Unpack parameters based on mode
+        # Extract fitted scatter from end of vector
+        fitted_sig_sne, fitted_sig_qso = SIGMA_INT_SNE, SIGMA_INT_QSO
+        if FIT_SCATTER and _n_scatter > 0 and mtype in ("lcdm", "log_decay"):
+            if COMBINED_MODE:
+                fitted_sig_sne = best_params[-2]
+                fitted_sig_qso = best_params[-1]
+            else:
+                fitted_sig_sne = best_params[-1]
+                fitted_sig_qso = fitted_sig_sne
+            print(f"      σ_int,SNe = {fitted_sig_sne:.4f}, σ_int,QSO = {fitted_sig_qso:.4f}")
+
         # Unpack parameters based on mode
         if mtype == "lcdm":
             if args.fixed_anchor or args.sanity_check:
-                # Fixed Anchor / Sanity Check: H0=67.4, M FREE (unless no_nuisance)
-                # params: [omch2, M...]
                 omch2 = best_params[0]
                 h0 = 67.4
                 if COMBINED_MODE:
@@ -1745,65 +2316,62 @@ for model in models_to_fit:
                  print(f"      -> A = {A:.3f}, zd = {zd:.3f}")
 
         elif mtype == "log_decay":
-            # LOG²-DECAY extraction: params end with [A, z_b, gamma_0, z_h]
-            if args.fixed_anchor:
+            _so = _n_scatter
+            if args.no_bubble:
+                # Kerr-Only: tail is (gamma_0, z_h) — no A or z_b
+                A, z_b = 0.0, 0.0   # not fitted
+                gamma_0, z_h = best_params[-2-_so], best_params[-1-_so]
+            else:
+                A, z_b, gamma_0, z_h = best_params[-4-_so], best_params[-3-_so], best_params[-2-_so], best_params[-1-_so]
+            if args.fixed_anchor or args.sanity_check:
                  h0 = 67.4
                  om = (best_params[0] + 0.0224) / (67.4 / 100) ** 2
                  if args.no_nuisance or args.asymmetric or args.sanity_check:
                       M = 0.0
-                      A, z_b, gamma_0, z_h = best_params[1], best_params[2], best_params[3], best_params[4]
+                 elif COMBINED_MODE:
+                      M = (best_params[1] + best_params[2]) / 2
                  else:
-                      if COMBINED_MODE:
-                           M = (best_params[1] + best_params[2]) / 2
-                      else:
-                           M = best_params[1]
-                      A, z_b, gamma_0, z_h = best_params[-4], best_params[-3], best_params[-2], best_params[-1]
-                 gamma = gamma_0
-                 print(f"      -> A = {A:.3f}, z_b = {z_b:.3f}, γ₀ = {gamma_0:.3f}, z_h = {z_h:.3f}")
-            elif args.sanity_check:
-                 h0 = 67.4
-                 om = (best_params[0] + 0.0224) / (67.4 / 100) ** 2
-                 M = 0.0
-                 A, z_b, gamma_0, z_h = best_params[1], best_params[2], best_params[3], best_params[4]
-                 gamma = gamma_0
-                 print(f"      -> A = {A:.3f}, z_b = {z_b:.3f}, γ₀ = {gamma_0:.3f}, z_h = {z_h:.3f}")
+                      M = best_params[1]
             elif args.asymmetric:
-                 # params: [H0, omch2, A, z_b, gamma_0, z_h] — no M
                  h0 = best_params[0]
                  om = (best_params[1] + 0.0224) / (h0 / 100) ** 2
                  M = 0.0
-                 A, z_b, gamma_0, z_h = best_params[2], best_params[3], best_params[4], best_params[5]
-                 gamma = gamma_0
-                 print(f"      -> A = {A:.3f}, z_b = {z_b:.3f}, γ₀ = {gamma_0:.3f}, z_h = {z_h:.3f}")
             elif args.no_nuisance:
                  h0 = best_params[0]
                  om = (best_params[1] + 0.0224) / (h0 / 100) ** 2
                  M = 0.0
-                 A, z_b, gamma_0, z_h = best_params[-4], best_params[-3], best_params[-2], best_params[-1]
-                 gamma = gamma_0
-                 print(f"      -> A = {A:.3f}, z_b = {z_b:.3f}, γ₀ = {gamma_0:.3f}, z_h = {z_h:.3f}")
             else:
-                 # params: [H0, omch2, M..., A, z_b, gamma_0, z_h]
                  h0 = best_params[0]
                  om = (best_params[1] + 0.0224) / (h0 / 100) ** 2
                  if COMBINED_MODE:
                       M = (best_params[2] + best_params[3]) / 2
-                      A, z_b, gamma_0, z_h = best_params[4], best_params[5], best_params[6], best_params[7]
                  else:
                       M = best_params[2]
-                      A, z_b, gamma_0, z_h = best_params[3], best_params[4], best_params[5], best_params[6]
-                 gamma = gamma_0
-                 print(f"      -> A = {A:.3f}, z_b = {z_b:.3f}, γ₀ = {gamma_0:.3f}, z_h = {z_h:.3f}")
+            gamma = gamma_0
+            if args.no_bubble:
+                print(f"      -> γ₀ = {gamma_0:.3f}, z_h = {z_h:.3f}  [Kerr-Only, A=0]")
+            else:
+                print(f"      -> A = {A:.3f}, z_b = {z_b:.3f}, γ₀ = {gamma_0:.3f}, z_h = {z_h:.3f}")
 
-        bic = best_chi2 + n_params * np.log(N)
-        aic = best_chi2 + 2 * n_params
+        n_eff = n_params
+        bic = best_chi2 + n_eff * np.log(N)
+        aic = best_chi2 + 2 * n_eff
         
-        results.append({
-            "name": name,
-            "H0": h0, "Om": om, "M": M, "gamma": gamma,
+        omc = om - 0.0224 / (h0 / 100)**2
+        omch2 = om * (h0 / 100.0)**2 - OMBH2_FIDUCIAL
+        _res_entry = {
+            "name": name, "mtype": mtype, "corr_kind": corr_kind,
+            "H0": h0, "Om": om, "Omc": omc, "Omch2": omch2, "M": M, "gamma": gamma,
             "chi2": best_chi2, "bic": bic, "aic": aic,
-            "params": best_params
-        })
+            "params": best_params, "n_eff": n_eff,
+            "sig_sne": fitted_sig_sne, "sig_qso": fitted_sig_qso
+        }
+        # Store model-specific params so display code doesn't need fragile params[-N] indexing
+        if mtype == "log_decay":
+            _res_entry.update({"A": A, "z_b": z_b, "z_h": z_h, "no_bubble": args.no_bubble})
+        elif mtype == "decay":
+            _res_entry.update({"A": A, "zd": zd})
+        results.append(_res_entry)
         
         if bic < best_overall_bic:
             best_overall_bic = bic
@@ -1821,9 +2389,9 @@ else:
 # ============================================================================
 # RESULTS TABLE
 # ============================================================================
-print("\n" + "=" * 105)
-print(f"{'Modelo':<24} {'H₀':>8} {'Ωₘ':>8} {'δM':>10} {'γ₀':>10} {'-2lnL':>10} {'BIC':>10} {'AIC':>10} {'ΔBIC':>8} {'ΔAIC':>8}")
-print("─" * 115)
+print("\n" + "=" * 115)
+print(f"{'Modelo':<24} {'H₀':>8} {'Ωₘ':>8} {'Ωc':>8} {'δM':>8} {'γ₀':>10} {'-2lnL':>10} {'BIC':>10} {'AIC':>10} {'ΔBIC':>8} {'ΔAIC':>8}")
+print("─" * 125)
 
 for res in results:
     dbic = res["bic"] - bic_lcdm
@@ -1831,21 +2399,105 @@ for res in results:
     
     # Check for "Decay" (case insensitive) to handle both "γCDM-Decay" and "γCDM-LOG²-Decay"
     if "log" in res["name"].lower() and "decay" in res["name"].lower():
-        # LOG²-DECAY: 4 model params [A, z_b, γ₀, z_h]
-        A_val = res.get('A', res['params'][-4])
-        zb_val = res.get('z_b', res['params'][-3])
-        g0_val = res.get('gamma', res['params'][-2])
-        zh_val = res.get('z_h', res['params'][-1])
-        print(f"{res['name']:<24} {res['H0']:>8.2f} {res['Om']:>8.3f} {res['M']:>10.3f}   γ={g0_val:>6.3f}  {res['chi2']:>10.1f} {res['bic']:>10.1f} {res['aic']:>10.1f} {dbic:>8.1f} {daic:>8.1f}")
-        print(f"{'':24} {'':>8} {'':>8} {'':>10}   A={A_val:>6.3f} zb={zb_val:.3f} zh={zh_val:.1f}")
+        # LOG²-DECAY: use stored model params (safe regardless of --fit-scatter)
+        A_val = res['A']
+        zb_val = res['z_b']
+        g0_val = res['gamma']
+        zh_val = res['z_h']
+        print(f"{res['name']:<24} {res['H0']:>8.2f} {res['Om']:>8.3f} {res['Omc']:>8.3f} {res['M']:>8.3f}   γ={g0_val:>6.3f}  {res['chi2']:>10.1f} {res['bic']:>10.1f} {res['aic']:>10.1f} {dbic:>8.1f} {daic:>8.1f}")
+        if res.get('no_bubble'):
+            print(f"{'':24} {'':>8} {'':>8} {'':>8} {'':>8}   A=0 (Kerr-Only) zh={zh_val:.1f}")
+        else:
+            print(f"{'':24} {'':>8} {'':>8} {'':>8} {'':>8}   A={A_val:>6.3f} zb={zb_val:.3f} zh={zh_val:.1f}")
     elif "decay" in res["name"].lower():
-        # Pure Decay: 2 model params [A, zd]
-        best_p = res["params"]
-        print(f"{res['name']:<24} {res['H0']:>8.2f} {res['Om']:>8.3f} {res['M']:>10.3f}   A={best_p[-2]:>6.3f}  {res['chi2']:>10.1f} {res['bic']:>10.1f} {res['aic']:>10.1f} {dbic:>8.1f} {daic:>8.1f}")
-        print(f"{'':24} {'':>8} {'':>8} {'':>10}   zd={best_p[-1]:.3f}")
+        # Pure Decay: use stored model params
+        A_val = res['A']
+        zd_val = res['zd']
+        print(f"{res['name']:<24} {res['H0']:>8.2f} {res['Om']:>8.3f} {res['Omc']:>8.3f} {res['M']:>8.3f}   A={A_val:>6.3f}  {res['chi2']:>10.1f} {res['bic']:>10.1f} {res['aic']:>10.1f} {dbic:>8.1f} {daic:>8.1f}")
+        print(f"{'':24} {'':>8} {'':>8} {'':>8} {'':>8}   zd={zd_val:.3f}")
     else:
-        print(f"{res['name']:<24} {res['H0']:>8.2f} {res['Om']:>8.3f} {res['M']:>10.3f} {res['gamma']:>10.4f} {res['chi2']:>10.1f} {res['bic']:>10.1f} {res['aic']:>10.1f} {dbic:>8.1f} {daic:>8.1f}")
-print("─" * 115)
+        print(f"{res['name']:<24} {res['H0']:>8.2f} {res['Om']:>8.3f} {res['Omc']:>8.3f} {res['M']:>8.3f} {res['gamma']:>10.4f} {res['chi2']:>10.1f} {res['bic']:>10.1f} {res['aic']:>10.1f} {dbic:>8.1f} {daic:>8.1f}")
+print("─" * 125)
+
+
+# ============================================================================
+# BAO (DESI DR1) REPORTING — --bao (fit breakdown) / --bao-null (null test)
+# ----------------------------------------------------------------------------
+# Both modes evaluate χ²_BAO at each model's best-fit and print a consistency
+# table. The crucial physical diagnostic is whether the model that fits
+# SNe+CC+CMB well ALSO sits within the BAO errors (χ²_BAO/ν ≲ 1).
+#
+#   --bao        : BAO is already part of the objective, so χ²_BAO is a
+#                  component of the reported `res["chi2"]`. We still print
+#                  the BREAKDOWN here so the reader can see the share of
+#                  χ²_BAO vs. SNe/CC/CMB inside the converged chi².
+#
+#   --bao-null   : BAO is NOT in the objective. χ²_BAO is evaluated at the
+#                  best-fit ONLY for diagnosis (strict goodness-of-fit test).
+# ============================================================================
+if NEED_BAO_BG and results:
+    print("\n" + "=" * 70)
+    if USE_BAO_FIT:
+        print("📐 BAO DIAGNOSTIC (DESI DR1) — χ² at best-fit (IN-FIT mode)")
+    else:
+        print("📐 BAO NULL TEST (DESI DR1) — χ² at best-fit (NOT in objective)")
+    print("=" * 70)
+    _ndof_bao_only = N_BAO_POINTS    # not subtracting fit params (strict test)
+    print(f"   {'Modelo':<24} {'χ²_BAO':>10} {'χ²/ν':>8} {'r_d':>8} "
+          f"{'Ωm':>8} {'H0':>8}")
+    print("   " + "─" * 68)
+    for res in results:
+        try:
+            h0 = res["H0"]
+            om = res["Om"]
+            omch2 = res["Omch2"]
+            # CAMB background at best-fit (with BAO extras)
+            _mu_bg, _hz_bg, _da_bg, _bao_ex = _fast_camb_bg(h0, omch2, want_bao=True)
+            if _bao_ex is None:
+                print(f"   {res['name']:<24} {'—':>10} {'—':>8} {'—':>8} {om:>8.3f} {h0:>8.2f}   (CAMB failed)")
+                continue
+            _dm = _bao_ex["dm"]
+            _dh = _bao_ex["dh"]
+            _rd = _bao_ex["rdrag"]
+            # Reconstruct Δμ at Z_EFF_DESI using the converged parameters.
+            _kind = res.get("corr_kind", "lcdm")
+            _kw = {}
+            if _kind == "gcdm":
+                _kw = {"gamma": res.get("gamma", 0.0)}
+            elif _kind in ("linear", "log2", "log3"):
+                _kw = {"gamma_0": res.get("gamma", 0.0)}
+            elif _kind == "decay":
+                _kw = {"A": res.get("A", 0.0), "zd": res.get("zd", 1.0)}
+            elif _kind == "log_decay":
+                _A = 0.0 if res.get("no_bubble") else res.get("A", 0.0)
+                _zb = res.get("z_b", 1.0) or 1.0
+                _kw = {
+                    "A": _A, "z_b": _zb,
+                    "gamma_0": res.get("gamma", 0.0),
+                    "z_h": res.get("z_h", 1e10) or 1e10,
+                }
+            _dmu_zeff = _bao_corr_at(Z_EFF_DESI, _kind, **_kw)
+            if BAO_PROPAGATE_CORRECTION:
+                _dm_model = _dm * (10.0 ** (_dmu_zeff / 5.0))
+            else:
+                _dm_model = _dm
+            _chi2_bao_val, _n_bao = compute_chi2_bao(_dm_model, _dh, _rd)
+            _chi2_red = _chi2_bao_val / _ndof_bao_only
+            # Store for downstream tools (MCMC / nested sampling summaries)
+            res["chi2_bao"]      = _chi2_bao_val
+            res["chi2_bao_red"]  = _chi2_red
+            res["rdrag_bestfit"] = _rd
+            print(f"   {res['name']:<24} {_chi2_bao_val:>10.2f} {_chi2_red:>8.2f} "
+                  f"{_rd:>8.2f} {om:>8.3f} {h0:>8.2f}")
+        except Exception as _e:
+            print(f"   {res['name']:<24}   (BAO eval failed: {_e})")
+    print("   " + "─" * 68)
+    print(f"   ν = {_ndof_bao_only} data points (fit DOF NOT subtracted for null test).")
+    print(f"   χ²/ν ≈ 1 → consistent with BAO.   χ²/ν ≫ 1 → model fails BAO.")
+    if USE_BAO_FIT:
+        print(f"   NOTE: these χ²_BAO are a SUBSET of each model's total -2lnL above.")
+    else:
+        print(f"   NOTE: null test — these numbers did NOT enter the MLE objective.")
 
 # Initialize Output Directory Early
 if not os.path.exists(args.output_dir):
@@ -1885,25 +2537,32 @@ if res_log2: print(f"   γCDM-LOG²           : H₀ = {res_log2['H0']:.2f} {che
 if res_log3: print(f"   γCDM-LOG³           : H₀ = {res_log3['H0']:.2f} {check_h0(res_log3['H0'])}")
 if res_decay:
     # Decay correction at z=0: Δμ = A·exp(0) = A → H₀(local) = H₀(cosmo)·10^(-A/5)
-    A_dec = res_decay['params'][-2]
-    zd_dec = res_decay['params'][-1]
-    h0_local_dec = res_decay['H0'] * 10**(-A_dec / 5)
+    A_dec = res_decay['A']
+    zd_dec = res_decay['zd']
+    h0_local_dec = h0_local(res_decay['H0'], A=A_dec, z_b=zd_dec, z_pivot=Z_PIVOT)
     print(f"   γCDM-Decay          : H₀ = {res_decay['H0']:.2f} {check_h0(res_decay['H0'])}")
     print(f"                         H₀(local) = {h0_local_dec:.2f} (A={A_dec:.3f}, zd={zd_dec:.2f}) {check_h0(h0_local_dec)}")
 if res_log_decay:
     # LOG²-DECAY: Δμ = A·exp(-z/z_b) + γ₀·[ln(1+z)]²·exp(-z/z_h)
     # At z=0: bubble_term = A·exp(0) = A, kerr_term = 0 → Δμ(0) = A
     # So H₀(local) = H₀(cosmo)·10^(-A/5) — A provides the SH0ES shift!
-    A_uni = res_log_decay['params'][-4]   # A
-    z_b_uni = res_log_decay['params'][-3]  # z_b
-    gamma_uni = res_log_decay['gamma']     # γ₀
-    z_h_uni = res_log_decay['params'][-1]  # z_h
-    h0_local_uni = res_log_decay['H0'] * 10**(-A_uni / 5)
+    # use stored model params (safe regardless of --fit-scatter)
+    A_uni = res_log_decay['A']
+    z_b_uni = res_log_decay['z_b']
+    gamma_uni = res_log_decay['gamma']
+    z_h_uni = res_log_decay['z_h']
+    M_uni = res_log_decay['M']
+    # H₀(local): uses helper h0_local (strict z→0 limit with z_pivot=0).
+    # If you want the rigorous SH0ES comparison, pass z_pivot=SH0ES_Z_PIVOT.
+    h0_local_uni = h0_local(res_log_decay['H0'],
+                            A=A_uni, z_b=z_b_uni,
+                            gamma_0=gamma_uni, z_h=z_h_uni,
+                            z_pivot=Z_PIVOT)
     print(f"   γCDM-LOG²-Decay        : H₀ = {res_log_decay['H0']:.2f} {check_h0(res_log_decay['H0'])}")
     print(f"                         H₀(local) = {h0_local_uni:.2f} (A={A_uni:.3f}, z_b={z_b_uni:.3f}) {check_h0(h0_local_uni)}")
     print(f"                         γ₀={gamma_uni:.3f}, z_h={z_h_uni:.2f} (Kerr geometry)")
 
-print("\n   → Evidencia de efecto Container Lens evolutivo")
+# print("\n   → Evidencia de efecto Container Lens evolutivo")
 
 # Interpretation
 if best_overall_model:
@@ -1927,6 +2586,7 @@ if best_overall_model and lcdm_res:
     print(f"   δM (Best): {best_overall_model['M']:.3f}")
     diff_M = best_overall_model['M'] - lcdm_res['M']
     print(f"   ΔδM:       {diff_M:.3f}")
+
 
     if abs(diff_M) < 0.5:
         print(f"   ✅ Valores de δM consistentes → γ₀ NO absorbe el offset")
@@ -2123,7 +2783,7 @@ def run_mock_test(title_suffix=""):
    Procedimiento:
      1. Generar datos sintéticos con ΛCDM puro (γ=0, H₀=67.4)
      2. Usar las mismas barras de error y redshifts que los datos reales
-     3. Ajustar ΛCDM y γCDM al mock
+     3. Ajustar ΛCDM y el modelo Target (LOG²-Decay o Lineal) al mock
      4. Verificar que γ ≈ 0 y ΔBIC ≈ 0 (o positivo)
    Realizaciones: {args.n_mock}
 """)
@@ -2162,7 +2822,6 @@ def run_mock_test(title_suffix=""):
 
         # Determine degrees of freedom dynamically for proper BIC
         k_lcdm = 4 if COMBINED_MODE else 3
-        k_gcdm = 5 if COMBINED_MODE else 4
 
         # Wrap chi2 evaluation to ensure isolation from global args and inject mock data
         def chi2_lcdm_mock(params):
@@ -2178,18 +2837,38 @@ def run_mock_test(title_suffix=""):
                  z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc
             return val
 
-        def chi2_gcdm_mock(params):
-            orig_fa, orig_sc, orig_nn, orig_asym = args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric
-            args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = False, False, False, False
-            global z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
-            _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc = z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
-            z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = z_mu_m, mu_obs_m, err_mu_m, z_cc_m, H_obs_m, err_cc_m
-            try:
-                val = chi2_gcdm(params)
-            finally:
-                 args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = orig_fa, orig_sc, orig_nn, orig_asym
-                 z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc
-            return val
+        if getattr(args, 'legacy', False):
+            # Target Linear Model
+            k_target = 5 if COMBINED_MODE else 4
+            target_name = "γCDM-LINEAL"
+            def chi2_target_mock(params):
+                orig_fa, orig_sc, orig_nn, orig_asym = args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric
+                args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = False, False, False, False
+                global z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
+                _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc = z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
+                z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = z_mu_m, mu_obs_m, err_mu_m, z_cc_m, H_obs_m, err_cc_m
+                try:
+                    val = chi2_gcdm_linear(params)
+                finally:
+                     args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = orig_fa, orig_sc, orig_nn, orig_asym
+                     z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc
+                return val
+        else:
+            # Target LOG2-DECAY Model
+            k_target = 8 if COMBINED_MODE else 7
+            target_name = "γCDM-LOG²-Decay"
+            def chi2_target_mock(params):
+                orig_fa, orig_sc, orig_nn, orig_asym = args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric
+                args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = False, False, False, False
+                global z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
+                _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc = z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc
+                z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = z_mu_m, mu_obs_m, err_mu_m, z_cc_m, H_obs_m, err_cc_m
+                try:
+                    val = chi2_gcdm_log_decay(params)
+                finally:
+                     args.fixed_anchor, args.sanity_check, args.no_nuisance, args.asymmetric = orig_fa, orig_sc, orig_nn, orig_asym
+                     z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc = _orig_z_mu, _orig_mu_obs, _orig_err_mu, _orig_z_cc, _orig_H_obs, _orig_err_cc
+                return val
 
 
         # Fit ΛCDM
@@ -2203,39 +2882,58 @@ def run_mock_test(title_suffix=""):
                       rng.uniform(-1.0, 1.0)]
             try:
                 res = minimize(chi2_lcdm_mock, x0, method='Nelder-Mead',
-                               options={'maxiter': 5000, 'xatol': 1e-6})
+                               options={'maxiter': 20000, 'maxfev': 20000, 'xatol': 1e-8, 'fatol': 1e-8})
                 if res.fun < best_lcdm_m:
                     best_lcdm_m = res.fun
             except Exception:
                 pass
 
-        # Fit γCDM
-        best_gcdm_m = np.inf
-        best_gamma_m = 0.0
+        # Fit Target Model
+        best_target_m = np.inf
+        target_p = None
         for _ in range(10):
-            if COMBINED_MODE:
-                x0 = [rng.uniform(50, 90), rng.uniform(0.05, 0.20),
-                      rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0),
-                      rng.uniform(-1.5, 0.5)]
+            if getattr(args, 'legacy', False):
+                # Linear Model: H0, omch2, M_sne, M_qso, gamma_0
+                if COMBINED_MODE:
+                    x0 = [rng.uniform(50, 90), rng.uniform(0.05, 0.20),
+                          rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0),
+                          rng.uniform(-1.5, 0.5)]
+                else:
+                    x0 = [rng.uniform(50, 90), rng.uniform(0.05, 0.20),
+                          rng.uniform(-1.0, 1.0), rng.uniform(-1.5, 0.5)]
             else:
-                x0 = [rng.uniform(50, 90), rng.uniform(0.05, 0.20),
-                      rng.uniform(-1.0, 1.0), rng.uniform(-1.5, 0.5)]
+                # Log2-Decay Model: H0, omch2, M_sne, M_qso, A, z_b, gamma_0, z_h
+                if COMBINED_MODE:
+                    x0 = [rng.uniform(50, 90), rng.uniform(0.05, 0.20),
+                          rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0),
+                          rng.uniform(-0.5, 0.5), rng.uniform(0.1, 2.0),
+                          rng.uniform(-1.5, 0.5), rng.uniform(10, 80)]
+                else:
+                    x0 = [rng.uniform(50, 90), rng.uniform(0.05, 0.20),
+                          rng.uniform(-1.0, 1.0),
+                          rng.uniform(-0.5, 0.5), rng.uniform(0.1, 2.0),
+                          rng.uniform(-1.5, 0.5), rng.uniform(10, 80)]
             try:
-                res = minimize(chi2_gcdm_mock, x0, method='Nelder-Mead',
-                               options={'maxiter': 5000, 'xatol': 1e-6})
-                if res.fun < best_gcdm_m:
-                    best_gcdm_m = res.fun
-                    best_gamma_m = res.x[-1]
+                res = minimize(chi2_target_mock, x0, method='Nelder-Mead',
+                               options={'maxiter': 20000, 'maxfev': 20000, 'xatol': 1e-8, 'fatol': 1e-8})
+                if res.fun < best_target_m:
+                    best_target_m = res.fun
+                    target_p = res.x
             except Exception:
                 pass
 
         bic_l = best_lcdm_m + k_lcdm * np.log(N)
-        bic_g = best_gcdm_m + k_gcdm * np.log(N)
+        bic_g = best_target_m + k_target * np.log(N)
         dbic_m = bic_g - bic_l
 
         aic_l = best_lcdm_m + 2 * k_lcdm
-        aic_g = best_gcdm_m + 2 * k_gcdm
+        aic_g = best_target_m + 2 * k_target
         daic_m = aic_g - aic_l
+
+        if getattr(args, 'legacy', False):
+            best_gamma_m = target_p[-1] if target_p is not None else 0.0
+        else:
+            best_gamma_m = target_p[-2] if target_p is not None else 0.0
 
         mock_gammas.append(best_gamma_m)
         mock_dbics.append(dbic_m)
@@ -2313,7 +3011,10 @@ if args.mcmc or args.nested:
                 sanity_check=args.sanity_check,
                 likelihood_type=LIKELIHOOD_TYPE,
                 nu=NU_DOF if NU_DOF is not None else 5.0,
-                C_inv_sne=C_inv_sne, ln_det_C_sne=ln_det_C_sne
+                C_inv_sne=C_inv_sne, ln_det_C_sne=ln_det_C_sne,
+                use_cmb=USE_CMB, fit_scatter=FIT_SCATTER,
+                cov_evals=_cov_evals, cov_evecs=_cov_evecs,
+                no_bubble=args.no_bubble
             )
         cov_label = f" (with {args.cov} covariance)" if C_inv_sne is not None else ""
         print(f"   ✅ Shared likelihoods loaded from gammacdm_likelihoods.py{cov_label}")
@@ -2342,7 +3043,8 @@ if args.mcmc or args.nested:
                 "--sigma-int-qso", str(args.sigma_int_qso),
                 "--qso-err-cut", str(args.qso_err_cut),
                 "--sne-err-cut", str(args.sne_err_cut),
-                "--z-min", str(args.z_min),
+                "--z-min-sne", str(args.z_min_sne),
+                "--z-min-qso", str(args.z_min_qso),
                 "--output-dir", args.output_dir
             ]
             
@@ -2376,6 +3078,11 @@ if args.mcmc or args.nested:
 
             if args.cov != 'none':
                 common_args.extend(["--cov", args.cov])
+
+            if args.cmb:
+                common_args.append("--cmb")
+            if FIT_SCATTER:
+                common_args.append("--fit-scatter")
             
             # ==================================================================
             # PARALLEL EXECUTION (Robust)
@@ -2576,7 +3283,10 @@ if args.mcmc or args.nested:
                      a_ld_val = res_log_decay.get('A_mean', 0)
                      zb_ld = res_log_decay.get('zb_mean', 0)
                      zh_ld = res_log_decay.get('zh_mean', 0)
-                     h0_local_ld = res_log_decay['H0_mean'] * 10**(-a_ld_val / 5) if a_ld_val != 0 else res_log_decay['H0_mean']
+                     h0_local_ld = (h0_local(res_log_decay['H0_mean'], A=a_ld_val,
+                                             z_b=(zb_ld if zb_ld > 0 else 1.0),
+                                             z_pivot=Z_PIVOT)
+                                    if a_ld_val != 0 else res_log_decay['H0_mean'])
                      print(f"   LOG²-DEC   | {h0_ld:<13} | γ={g_ld_val:<10.4f} | {res_log_decay['deltaM_mean']:.3f} (S:{res_log_decay.get('M_sne_mean', 0):.3f})")
                      print(f"              |               | A={a_ld_val:.3f} zb={zb_ld:.3f} zh={zh_ld:.1f}")
                      print(f"              | H₀(local)={h0_local_ld:.1f} |               |")
@@ -2603,7 +3313,6 @@ if args.mcmc or args.nested:
                     print(f"      Ωb h² (Fix)  ≈ {ombh2_log2:.4f}")
                     print(f"      Ωc h² (Log2) = {omch2_log2:.4f}")
                     print(f"      Ωm h² (Tot)  = {omh2_log2_total:.4f}")
-                    print(f"      Ωc h² (Planck) ≈ 0.120")
 
                 if res_decay:
                     omch2_dec = res_decay.get('omch2_mean', 0.12)
@@ -2620,6 +3329,7 @@ if args.mcmc or args.nested:
                     print(f"      Ωb h² (Fix)  ≈ {ombh2_ld:.4f}")
                     print(f"      Ωc h² (LD)   = {omch2_ld:.4f}")
                     print(f"      Ωm h² (Tot)  = {omch2_ld + ombh2_ld:.4f}")
+                    print(f"      Ωc h² (Planck) ≈ 0.120")
 
                 # ==============================================================
                 # LOAD SAMPLES FOR PLOTTING
@@ -2681,20 +3391,44 @@ if args.mcmc or args.nested:
         # MCMC FLOW (only when NOT using --nested subprocess mode)
         # ========================================================================
         if not args.nested:
-            # Shared priors (IDENTICAL for all models)
-            if COMBINED_MODE:
-                base_params = {
-                    "H0": {"prior": {"min": H0_MIN, "max": H0_MAX}, "ref": 67, "proposal": 2.0},
-                    "omch2": {"prior": {"min": OMCH2_MIN, "max": OMCH2_MAX}, "ref": 0.12, "proposal": 0.02},
-                    "M_sne": {"prior": {"min": M_MIN, "max": M_MAX}, "ref": 0.0, "proposal": 0.1},
-                    "M_qso": {"prior": {"min": M_MIN, "max": M_MAX}, "ref": 0.0, "proposal": 0.1},
-                    "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06}
+            if not args.legacy:
+                # Shared priors (IDENTICAL for all models)
+                # Gaussian calibration priors on δM (externally justified):
+                #   M_sne ~ N(0, 0.05): Pantheon+ residual calibration ~0.02-0.04 mag
+                #   M_qso ~ N(0, 0.15): Lusso+20 L_X-L_UV intercept ~0.1-0.2 mag
+                if COMBINED_MODE:
+                    base_params = {
+                        "H0": {"prior": {"min": H0_MIN, "max": H0_MAX}, "ref": 67, "proposal": 2.0},
+                        "omch2": {"prior": {"min": OMCH2_MIN, "max": OMCH2_MAX}, "ref": 0.12, "proposal": 0.02},
+                        "M_sne": {"prior": {"dist": "norm", "loc": 0, "scale": 0.05}, "ref": 0.0, "proposal": 0.02},
+                        "M_qso": {"prior": {"dist": "norm", "loc": 0, "scale": 0.15}, "ref": 0.0, "proposal": 0.05},
+                        "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06}
+                else:
+                    base_params = {
+                        "H0": {"prior": {"min": H0_MIN, "max": H0_MAX}, "ref": 67, "proposal": 2.0},
+                        "omch2": {"prior": {"min": OMCH2_MIN, "max": OMCH2_MAX}, "ref": 0.12, "proposal": 0.02},
+                        "mabs": {"prior": {"dist": "norm", "loc": 0, "scale": 0.05}, "ref": 0.0, "proposal": 0.02},
+                        "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06}           
             else:
-                base_params = {
-                    "H0": {"prior": {"min": H0_MIN, "max": H0_MAX}, "ref": 67, "proposal": 2.0},
-                    "omch2": {"prior": {"min": OMCH2_MIN, "max": OMCH2_MAX}, "ref": 0.12, "proposal": 0.02},
-                    "mabs": {"prior": {"min": M_MIN, "max": M_MAX}, "ref": 0.0, "proposal": 0.1},
-                    "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06}
+                if COMBINED_MODE:
+                    base_params = {
+                        "H0": {"prior": {"min": H0_MIN, "max": H0_MAX}, "ref": 67, "proposal": 2.0},
+                        "omch2": {"prior": {"min": OMCH2_MIN, "max": OMCH2_MAX}, "ref": 0.12, "proposal": 0.02},
+                        "M_sne": {"prior": {"min": M_MIN, "max": M_MAX}, "ref": 0.0, "proposal": 0.1},
+                        "M_qso": {"prior": {"min": M_MIN, "max": M_MAX}, "ref": 0.0, "proposal": 0.1},
+                        "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06}
+                else:
+                    base_params = {
+                        "H0": {"prior": {"min": H0_MIN, "max": H0_MAX}, "ref": 67, "proposal": 2.0},
+                        "omch2": {"prior": {"min": OMCH2_MIN, "max": OMCH2_MAX}, "ref": 0.12, "proposal": 0.02},
+                        "mabs": {"prior": {"min": M_MIN, "max": M_MAX}, "ref": 0.0, "proposal": 0.1},
+                        "ombh2": 0.0224, "ns": 0.965, "As": 2.1e-9, "tau": 0.06}
+
+
+            if FIT_SCATTER:
+                base_params["sigma_int_sne"] = {"prior": {"min": SINT_SNE_MIN, "max": SINT_SNE_MAX}, "ref": 0.1, "proposal": 0.01}
+                if COMBINED_MODE:
+                    base_params["sigma_int_qso"] = {"prior": {"min": SINT_QSO_MIN, "max": SINT_QSO_MAX}, "ref": 0.5, "proposal": 0.1}
 
             # Apply fixed-anchor / sanity-check overrides to base_params
             if args.fixed_anchor:
@@ -2710,9 +3444,6 @@ if args.mcmc or args.nested:
                 # H0 is fixed for ALL models in sanity check.
                 base_params["H0"] = 67.4
                 # We leave omch2 and M free here, and constrain them per-model below.
-
-
-
 
             # MCMC sampler configuration
             sampler_cfg = {
@@ -2747,10 +3478,6 @@ if args.mcmc or args.nested:
                 print(f"   ⚠️ Could not load ΛCDM samples from file, using in-memory: {e}")
                 samples_lcdm = sampler_lcdm.products().get("sample")
             
-        # Report ΛCDM MCMC if not nested
-        if not args.nested:
-            report_model_summary("ΛCDM", samples_lcdm, args, logZ=logZ_lcdm, title_prefix=f"📋 {sampler_name.upper()} —")
-
         # ── γCDM-LOG² MCMC (legacy only, not in nested subprocess mode) ──
         if not args.nested and args.legacy:
             print(f"\n⏳ Running γCDM-LOG² {sampler_name}...")
@@ -2811,25 +3538,36 @@ if args.mcmc or args.nested:
 
 
         # ── γCDM-LOG²-DECAY MCMC (only when NOT using --nested subprocess mode) ──
+        # Unified: A·exp(-z/z_b) + γ₀·[ln(1+z)]²·exp(-z/z_h)
+        # With --no-bubble: Kerr-Only Δμ = γ₀·[ln(1+z)]²·exp(-z/z_h)
         if not args.nested:
-            print(f"\n⏳ Running γCDM-LOG²-Decay {sampler_name}...")
-            # Unified: A·exp(-z/z_b) + γ₀·[ln(1+z)]²·exp(-z/z_h)
-            # NOTE: For MCMC/Nested we use TIGHTER priors than MLE.
-            # MLE uses ZH_MAX=1e10 (unconstrained) to find the global optimum.
-            # But MCMC/Nested cannot explore 1e10 of flat prior volume efficiently.
-            # We cap z_h at 100 (any z_h>100 is equivalent to z_h=∞ for all z<7).
-            ZH_MCMC_MAX = 100.0   # Sampler-specific cap (MLE uses ZH_MAX=1e10)
-            log_decay_p = {**base_params, 
-                       "A": {"prior": {"min": -1.0, "max": 1.0}, "ref": -0.175, "proposal": 0.05},
-                       "zb": {"prior": {"min": 0.01, "max": 5.0}, "ref": 0.4, "proposal": 0.1},
-                       "gamma_log_decay": {"prior": {"min": -2.0, "max": 0.0}, "ref": -0.8, "proposal": 0.05},
-                       "zh": {"prior": {"min": ZH_MIN, "max": ZH_MCMC_MAX}, "ref": 42.0, "proposal": 5.0}}
-            # Tighten δM priors for LOG²-Decay to break A↔δM degeneracy
-            if COMBINED_MODE and isinstance(log_decay_p.get("M_sne"), dict):
-                log_decay_p["M_sne"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
-                log_decay_p["M_qso"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
-            elif not COMBINED_MODE and isinstance(log_decay_p.get("mabs"), dict):
-                log_decay_p["mabs"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
+            _model_label = "γCDM-Kerr-Only" if args.no_bubble else "γCDM-LOG²-Decay"
+            print(f"\n⏳ Running {_model_label} {sampler_name}...")
+            if not args.legacy:
+                # Conservative priors, log-uniform z_h reparametrisation.
+                log_decay_p = {**base_params,
+                        "gamma_log_decay": {"prior": {"min": -3.0, "max": 1.0}, "ref": -0.8, "proposal": 0.1},
+                        "log_zh": {"prior": {"min": 0.0, "max": 2.301}, "ref": 1.62, "proposal": 0.15},
+                        "zh": {"value": "lambda log_zh: 10**log_zh", "latex": r"z_h"}}
+                if not args.no_bubble:
+                    # Add local bubble parameters only when NOT in Kerr-Only mode
+                    log_decay_p["A"]  = {"prior": {"min": -2.0, "max": 2.0}, "ref": -0.175, "proposal": 0.1}
+                    log_decay_p["zb"] = {"prior": {"min": 0.01, "max": 5.0}, "ref": 0.4, "proposal": 0.1}
+            else:
+                ZH_MCMC_MAX = 100.0
+                log_decay_p = {**base_params, 
+                        "gamma_log_decay": {"prior": {"min": -2.0, "max": 0.0}, "ref": -0.8, "proposal": 0.05},
+                        "zh": {"prior": {"min": ZH_MIN, "max": ZH_MCMC_MAX}, "ref": 42.0, "proposal": 5.0}}
+                if not args.no_bubble:
+                    log_decay_p["A"]  = {"prior": {"min": -1.0, "max": 1.0}, "ref": -0.175, "proposal": 0.05}
+                    log_decay_p["zb"] = {"prior": {"min": 0.01, "max": 5.0}, "ref": 0.4, "proposal": 0.1}
+                # Tighten δM priors to break A↔δM degeneracy (only relevant with bubble)
+                if not args.no_bubble:
+                    if COMBINED_MODE and isinstance(log_decay_p.get("M_sne"), dict):
+                        log_decay_p["M_sne"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
+                        log_decay_p["M_qso"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
+                    elif not COMBINED_MODE and isinstance(log_decay_p.get("mabs"), dict):
+                        log_decay_p["mabs"] = {"prior": {"min": -1.0, "max": 1.0}, "ref": 0.0, "proposal": 0.05}
 
             if args.asymmetric or args.no_nuisance or args.sanity_check:
                  if COMBINED_MODE:
@@ -2967,6 +3705,8 @@ if args.mcmc or args.nested:
             plt.tight_layout()
             h0_plot_path = os.path.join(args.output_dir, f"{prefix}_H0_comparison.png")
             plt.savefig(h0_plot_path, dpi=200, bbox_inches='tight')
+            h0_log_path = os.path.join("logs", f"{SESSION_TIMESTAMP}_{prefix}_H0_comparison.png")
+            plt.savefig(h0_log_path, dpi=200, bbox_inches='tight')
             print(f"   ✅ {h0_plot_path}")
 
             # --- B. PERFECT LOG²-DECAY CORNER PLOT ---
@@ -3068,6 +3808,8 @@ if args.mcmc or args.nested:
                 
                 corner_plot_path = os.path.join(args.output_dir, f"{prefix}_unified_comparison_corner.png")
                 g.export(corner_plot_path)
+                corner_log_path = os.path.join("logs", f"{SESSION_TIMESTAMP}_{prefix}_unified_comparison_corner.png")
+                g.export(corner_log_path)
                 print(f"   ✅ {corner_plot_path}")
 
             # --- C. INDIVIDUAL LOG2 PARAMETER SPACE (Full detail) ---
@@ -3083,7 +3825,7 @@ if args.mcmc or args.nested:
                 full_names = [n for i, n in enumerate(full_names) if valid[i]]
                 full_labels = [l for i, l in enumerate(full_labels) if valid[i]]
 
-                if not (args.sanity_check or args.fixed_anchor or args.asymmetric or args.no_nuisance):
+                if not (args.sanity_check or args.asymmetric or args.no_nuisance):
                    m_vals, _ = _get_M(s_log2, COMBINED_MODE)
                    if COMBINED_MODE:
                        ms = _safe_get(s_log2, "M_sne")
@@ -3105,8 +3847,11 @@ if args.mcmc or args.nested:
                                                    names=full_names, labels=full_labels, label="γCDM-LOG²"),
                                         filled=True, color_line='#e11d48')
                     plt.suptitle(r"$\gamma$CDM-LOG²: Full Parameter Space Topology", fontsize=16, y=1.02)
-                    plt.savefig(os.path.join(args.output_dir, f"{prefix}_log2_full_corner.png"), dpi=150, bbox_inches='tight')
-                    print(f"   ✅ chains/{prefix}_log2_full_corner.png")
+                    log2_corner_path = os.path.join(args.output_dir, f"{prefix}_log2_full_corner.png")
+                    plt.savefig(log2_corner_path, dpi=150, bbox_inches='tight')
+                    log2_log_path = os.path.join("logs", f"{SESSION_TIMESTAMP}_{prefix}_log2_full_corner.png")
+                    plt.savefig(log2_log_path, dpi=150, bbox_inches='tight')
+                    print(f"   ✅ {log2_corner_path}")
 
             # --- D. INDIVIDUAL LOG-DECAY PARAMETER SPACE (Full detail) ---
             if "log_decay" in plot_models:
@@ -3123,7 +3868,7 @@ if args.mcmc or args.nested:
                 full_names = [n for i, n in enumerate(full_names) if valid[i]]
                 full_labels = [l for i, l in enumerate(full_labels) if valid[i]]
 
-                if not (args.sanity_check or args.fixed_anchor or args.asymmetric or args.no_nuisance):
+                if not (args.sanity_check or args.asymmetric or args.no_nuisance):
                    if COMBINED_MODE:
                        ms = _safe_get(s_ld, "M_sne")
                        mq = _safe_get(s_ld, "M_qso")
@@ -3144,8 +3889,11 @@ if args.mcmc or args.nested:
                                                    names=full_names, labels=full_labels, label="γCDM-LOG²-Decay"),
                                         filled=True, color_line='#eab308')
                     plt.suptitle(r"$\gamma$CDM-LOG²-Decay: Full Parameter Space Topology", fontsize=16, y=1.02)
-                    plt.savefig(os.path.join(args.output_dir, f"{prefix}_log_decay_full_corner.png"), dpi=150, bbox_inches='tight')
-                    print(f"   ✅ chains/{prefix}_log_decay_full_corner.png")
+                    ld_corner_path = os.path.join(args.output_dir, f"{prefix}_log_decay_full_corner.png")
+                    plt.savefig(ld_corner_path, dpi=150, bbox_inches='tight')
+                    ld_log_path = os.path.join("logs", f"{SESSION_TIMESTAMP}_{prefix}_log_decay_full_corner.png")
+                    plt.savefig(ld_log_path, dpi=150, bbox_inches='tight')
+                    print(f"   ✅ {ld_corner_path}")
 
             # --- E. INDIVIDUAL DECAY PARAMETER SPACE (Full detail) ---
             if "decay" in plot_models:
@@ -3160,7 +3908,7 @@ if args.mcmc or args.nested:
                 full_names = [n for i, n in enumerate(full_names) if valid[i]]
                 full_labels = [l for i, l in enumerate(full_labels) if valid[i]]
 
-                if not (args.sanity_check or args.fixed_anchor or args.asymmetric or args.no_nuisance):
+                if not (args.sanity_check or args.asymmetric or args.no_nuisance):
                    if COMBINED_MODE:
                        ms = _safe_get(s_dec, "M_sne")
                        mq = _safe_get(s_dec, "M_qso")
@@ -3181,8 +3929,11 @@ if args.mcmc or args.nested:
                                                    names=full_names, labels=full_labels, label="γCDM-Decay"),
                                         filled=True, color_line='#2563eb')
                     plt.suptitle(r"$\gamma$CDM-Decay: Full Parameter Space Topology", fontsize=16, y=1.02)
-                    plt.savefig(os.path.join(args.output_dir, f"{prefix}_decay_full_corner.png"), dpi=150, bbox_inches='tight')
-                    print(f"   ✅ chains/{prefix}_decay_full_corner.png")
+                    decay_corner_path = os.path.join(args.output_dir, f"{prefix}_decay_full_corner.png")
+                    plt.savefig(decay_corner_path, dpi=150, bbox_inches='tight')
+                    decay_log_path = os.path.join("logs", f"{SESSION_TIMESTAMP}_{prefix}_decay_full_corner.png")
+                    plt.savefig(decay_log_path, dpi=150, bbox_inches='tight')
+                    print(f"   ✅ {decay_corner_path}")
 
         except Exception as e:
             print(f"   ⚠️ Error crítico en generación de gráficos: {e}")
@@ -3217,6 +3968,27 @@ if args.mock:
     print("  ✓ Mock test γ=0 ejecutado (validación de pipeline)")
 if not args.no_quasars and not args.quasars_only:
     print(f"  ✓ Quasars incluidos (err < {args.qso_err_cut}, M_sne/M_qso separados)")
+if USE_EVO:
+    print("  ✓ Optimizer: Differential evolution (5 × DE + dual_annealing + NM/Powell multi-polish + perturbation)")
+else:
+    print("  ✓ Optimizer: Nelder-Mead")
+if USE_CMB:
+    print(f"  ✓ CMB shift parameter prior (R = {R_PLANCK} ± {SIGMA_R_PLANCK}, σ_corr = {SIGMA_CORR_CMB} mag)")
+if USE_BAO_FIT:
+    print(f"  ✓ BAO (DESI DR1, {N_BAO_POINTS} pts) in joint likelihood — Δμ propagated to D_M if BAO_PROPAGATE_CORRECTION is true")
+    if best_overall_model and "chi2_bao" in best_overall_model:
+        print(f"      Best-fit χ²_BAO/ν = {best_overall_model['chi2_bao_red']:.2f} "
+              f"({best_overall_model['name']})")
+elif USE_BAO_NULL:
+    print(f"  ✓ BAO (DESI DR1) null test performed — not in MLE objective")
+    if best_overall_model and "chi2_bao" in best_overall_model:
+        _cr = best_overall_model['chi2_bao_red']
+        _tag = "PASS" if _cr < 2.0 else ("TENSION" if _cr < 5.0 else "FAIL")
+        print(f"      Best-fit χ²_BAO/ν = {_cr:.2f}  [{_tag}]")
+if FIT_SCATTER:
+    _best_res = best_overall_model or lcdm_res
+    if _best_res:
+        print(f"  ✓ Intrinsic scatter fitted: σ_int,SNe = {_best_res.get('sig_sne', '?'):.4f}, σ_int,QSO = {_best_res.get('sig_qso', '?'):.4f}")
 
 print(f"""
 Resultados clave:
@@ -3225,6 +3997,13 @@ Resultados clave:
   ΔAIC = {delta_aic:.1f} (negativo → γCDM preferido)
   K_BIC (approx) = {K_BIC_approx:.1f}  ← BIC-implied odds, NOT Bayes factor
 """)
+
+# Silent-failure accounting (tracked by ExceptionCounter in gammacdm_core).
+# If this prints a non-zero number, CAMB or the likelihood returned 1e10 during
+# optimisation and the final MLE may be biased toward the edges of the prior.
+print("Silent-failure accounting (numerical):")
+print(CAMB_ERRORS.summary())
+print(CHI2_ERRORS.summary())
 
 #   → γCDM es preferido incluso con δM nuisance incluido
 #   → DECAY es mejor porque acerca SH0ES y CMB

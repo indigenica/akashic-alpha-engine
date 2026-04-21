@@ -30,13 +30,27 @@ References:
 
 import numpy as np
 
+# Single source of truth for physical constants (Planck 2018 shift, c, etc.).
+# Do NOT hard-code Z_STAR, R_PLANCK, SIGMA_R_PLANCK, SIGMA_CORR_CMB or
+# C_LIGHT_KMS here; they come from cosmo_constants.
+from cosmo_constants import (
+    Z_STAR as _Z_STAR_CONST,
+    R_PLANCK as _R_PLANCK_CONST,
+    SIGMA_R_PLANCK as _SIG_R_CONST,
+    SIGMA_CORR_CMB as _SIG_CORR_CONST,
+    C_LIGHT_KMS as _C_LIGHT_CONST,
+)
+
 
 def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                        sne_mask, combined_mode,
                        sigma_int_sne=0.0, sigma_int_qso=0.0,
                        no_nuisance=False, asymmetric=False, sanity_check=False,
                        likelihood_type='gaussian', nu=5.0,
-                       C_inv_sne=None, ln_det_C_sne=None):
+                       C_inv_sne=None, ln_det_C_sne=None,
+                       use_cmb=False, fit_scatter=False,
+                       cov_evals=None, cov_evecs=None,
+                       no_bubble=False):
     """
     Factory that creates 4 configured Cobaya Likelihood classes.
 
@@ -78,6 +92,13 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
         When provided, SNe are evaluated with the full correlated Gaussian likelihood.
     ln_det_C_sne : float or None
         log-determinant of the SNe Ia covariance matrix.
+    use_cmb : bool
+        If True, add Planck 2018 CMB shift parameter prior (R = 1.7502 ± 0.0046)
+        and correction penalty at z* = 1089.92.
+    fit_scatter : bool
+        If True, treat σ_int,SNe and σ_int,QSO as free sampled parameters.
+    cov_evals, cov_evecs : np.ndarray or None
+        Eigenvalues/vectors of C_base (no σ_int) for efficient scatter fitting.
 
     Returns
     -------
@@ -160,6 +181,76 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
 
         return logL
 
+    # ── CMB shift parameter (Planck 2018) — constants come from cosmo_constants ──
+    _Z_STAR = _Z_STAR_CONST
+    _R_PLANCK = _R_PLANCK_CONST
+    _SIG_R = _SIG_R_CONST
+    _SIG_CORR = _SIG_CORR_CONST
+    _C_LIGHT = _C_LIGHT_CONST
+    _use_cmb = use_cmb
+
+    _z_req_cmb = np.array([_Z_STAR]) if _use_cmb else np.array([])
+
+    def _cmb_logL(provider, delta_mu_star=0.0):
+        """Gaussian log-likelihood penalty from Planck shift parameter R."""
+        if not _use_cmb:
+            return 0.0
+        try:
+            H0 = provider.get_param("H0")
+            Om = provider.get_param("omegam")
+            DA_star = provider.get_angular_diameter_distance(_z_req_cmb)[0]
+            DC_star = (1 + _Z_STAR) * DA_star
+            R_mod = np.sqrt(Om) * (H0 / _C_LIGHT) * DC_star
+            pen = -0.5 * ((R_mod - _R_PLANCK) / _SIG_R) ** 2
+            if abs(delta_mu_star) > 1e-10:
+                pen += -0.5 * (delta_mu_star / _SIG_CORR) ** 2
+            return pen
+        except Exception:
+            return -1e10
+
+    # ── Scatter fitting state ──
+    _fit_scatter = fit_scatter
+    _cov_evals = cov_evals
+    _cov_evecs = cov_evecs
+    _err_mu_raw = err_mu
+
+    def _logL_mu_scatter(residuals, sig_sne, sig_qso):
+        """Gaussian log-likelihood with variable σ_int (for --fit-scatter).
+        
+        NOTE: When --fit-scatter is active, the likelihood is always Gaussian,
+        even if --student or --cauchy were requested.  Fitting σ_int already
+        accounts for heavy tails via an enlarged scatter; combining both would
+        double-count the outlier absorption and is not statistically well-defined.
+        """
+        logL = 0.0
+        if _cov_evals is not None:
+            if combined_mode and sne_mask is not None:
+                r_sne = residuals[sne_mask]
+                v = _cov_evecs.T @ r_sne
+                lam_eff = _cov_evals + sig_sne**2
+                logL += -0.5 * (np.sum(v**2 / lam_eff) + np.sum(np.log(lam_eff)))
+                r_qso = residuals[_qso_mask]
+                e_qso = _err_mu_raw[_qso_mask]
+                s2 = e_qso**2 + sig_qso**2
+                logL += -0.5 * np.sum(r_qso**2 / s2 + np.log(s2))
+            else:
+                v = _cov_evecs.T @ residuals
+                lam_eff = _cov_evals + sig_sne**2
+                logL += -0.5 * (np.sum(v**2 / lam_eff) + np.sum(np.log(lam_eff)))
+        else:
+            if combined_mode and sne_mask is not None:
+                r_sne = residuals[sne_mask]
+                e_sne = _err_mu_raw[sne_mask]
+                s2_sne = e_sne**2 + sig_sne**2
+                logL += -0.5 * np.sum(r_sne**2 / s2_sne + np.log(s2_sne))
+                r_qso = residuals[_qso_mask]
+                e_qso = _err_mu_raw[_qso_mask]
+                s2_qso = e_qso**2 + sig_qso**2
+                logL += -0.5 * np.sum(r_qso**2 / s2_qso + np.log(s2_qso))
+            else:
+                s2 = _err_mu_raw**2 + sig_sne**2
+                logL += -0.5 * np.sum(residuals**2 / s2 + np.log(s2))
+        return logL
 
     # ================================================================
     # 1. ΛCDM  —  No model correction
@@ -168,6 +259,15 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
         lcdm_params = {'M_sne': None, 'M_qso': None}
     else:
         lcdm_params = {'mabs': None}
+    if _fit_scatter:
+        if combined_mode:
+            lcdm_params['sigma_int_sne'] = None
+            lcdm_params['sigma_int_qso'] = None
+        else:
+            if has_sne:
+                lcdm_params['sigma_int_sne'] = None
+            else:
+                lcdm_params['sigma_int_qso'] = None
 
     class LCDMLikelihood(Likelihood):
         """
@@ -188,9 +288,13 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             self.norm_cc = norm_cc
 
         def get_requirements(self):
-            reqs = {"angular_diameter_distance": {"z": np.concatenate([self.z_mu, self.z_cc])}}
+            _zall = np.concatenate([self.z_mu, self.z_cc, _z_req_cmb])
+            reqs = {"angular_diameter_distance": {"z": _zall}}
             if len(self.z_cc) > 0:
                 reqs["Hubble"] = {"z": self.z_cc}
+            if _use_cmb:
+                reqs["H0"] = None
+                reqs["omegam"] = None
             return reqs
 
         def logp(self, **pv):
@@ -211,12 +315,27 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 mu_th = mu_th + pv.get('mabs', 0.0)
 
             # Log-likelihood (may be Gaussian, Student-t, or Cauchy)
-            logL = _logL_mu(self.mu_obs - mu_th, self.err_eff)
+            res = self.mu_obs - mu_th
+            if _fit_scatter:
+                if self.combined:
+                    s_sne = pv.get('sigma_int_sne', 0.1)
+                    s_qso = pv.get('sigma_int_qso', 0.5)
+                else:
+                    if has_sne:
+                        s_sne = pv.get('sigma_int_sne', 0.1)
+                        s_qso = s_sne
+                    else:
+                        s_qso = pv.get('sigma_int_qso', 0.5)
+                        s_sne = s_qso
+                logL = _logL_mu_scatter(res, s_sne, s_qso)
+            else:
+                logL = _logL_mu(res, self.err_eff)
 
             if len(self.z_cc) > 0:
                 H_th = self.provider.get_Hubble(self.z_cc)
                 logL += -0.5 * (np.sum(((self.H_obs - H_th) / self.err_cc)**2) + self.norm_cc)
 
+            logL += _cmb_logL(self.provider)
             return logL
 
     # ================================================================
@@ -226,6 +345,15 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
         log2_params = {'gamma_log2': None, 'M_sne': None, 'M_qso': None}
     else:
         log2_params = {'gamma_log2': None, 'mabs': None}
+    if _fit_scatter:
+        if combined_mode:
+            log2_params['sigma_int_sne'] = None
+            log2_params['sigma_int_qso'] = None
+        else:
+            if has_sne:
+                log2_params['sigma_int_sne'] = None
+            else:
+                log2_params['sigma_int_qso'] = None
 
     class GammaCDM_LOG2_Likelihood(Likelihood):
         """
@@ -247,9 +375,13 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             self.restrict_m = restrict_m
 
         def get_requirements(self):
-            reqs = {"angular_diameter_distance": {"z": np.concatenate([self.z_mu, self.z_cc])}}
+            _zall = np.concatenate([self.z_mu, self.z_cc, _z_req_cmb])
+            reqs = {"angular_diameter_distance": {"z": _zall}}
             if len(self.z_cc) > 0:
                 reqs["Hubble"] = {"z": self.z_cc}
+            if _use_cmb:
+                reqs["H0"] = None
+                reqs["omegam"] = None
             return reqs
 
         def logp(self, **pv):
@@ -272,12 +404,28 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 else:
                     mu_th = mu_th + pv.get('mabs', 0.0)
 
-            logL = _logL_mu(self.mu_obs - mu_th, self.err_eff)
+            res = self.mu_obs - mu_th
+            if _fit_scatter:
+                if self.combined:
+                    s_sne = pv.get('sigma_int_sne', 0.1)
+                    s_qso = pv.get('sigma_int_qso', 0.5)
+                else:
+                    if has_sne:
+                        s_sne = pv.get('sigma_int_sne', 0.1)
+                        s_qso = s_sne
+                    else:
+                        s_qso = pv.get('sigma_int_qso', 0.5)
+                        s_sne = s_qso
+                logL = _logL_mu_scatter(res, s_sne, s_qso)
+            else:
+                logL = _logL_mu(res, self.err_eff)
 
             if len(self.z_cc) > 0:
                 H_th = self.provider.get_Hubble(self.z_cc)
                 logL += -0.5 * (np.sum(((self.H_obs - H_th) / self.err_cc)**2) + self.norm_cc)
 
+            dmu_star = gamma0 * np.log1p(_Z_STAR)**2
+            logL += _cmb_logL(self.provider, dmu_star)
             return logL
 
     # ================================================================
@@ -287,6 +435,15 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
         decay_params = {'A': None, 'zd': None, 'M_sne': None, 'M_qso': None}
     else:
         decay_params = {'A': None, 'zd': None, 'mabs': None}
+    if _fit_scatter:
+        if combined_mode:
+            decay_params['sigma_int_sne'] = None
+            decay_params['sigma_int_qso'] = None
+        else:
+            if has_sne:
+                decay_params['sigma_int_sne'] = None
+            else:
+                decay_params['sigma_int_qso'] = None
 
     class DecayLikelihood(Likelihood):
         """
@@ -309,9 +466,13 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             self.restrict_m = restrict_m
 
         def get_requirements(self):
-            reqs = {"angular_diameter_distance": {"z": np.concatenate([self.z_mu, self.z_cc])}}
+            _zall = np.concatenate([self.z_mu, self.z_cc, _z_req_cmb])
+            reqs = {"angular_diameter_distance": {"z": _zall}}
             if len(self.z_cc) > 0:
                 reqs["Hubble"] = {"z": self.z_cc}
+            if _use_cmb:
+                reqs["H0"] = None
+                reqs["omegam"] = None
             return reqs
 
         def logp(self, **pv):
@@ -335,12 +496,28 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 else:
                     mu_th = mu_th + pv.get('mabs', 0.0)
 
-            logL = _logL_mu(self.mu_obs - mu_th, self.err_eff)
+            res = self.mu_obs - mu_th
+            if _fit_scatter:
+                if self.combined:
+                    s_sne = pv.get('sigma_int_sne', 0.1)
+                    s_qso = pv.get('sigma_int_qso', 0.5)
+                else:
+                    if has_sne:
+                        s_sne = pv.get('sigma_int_sne', 0.1)
+                        s_qso = s_sne
+                    else:
+                        s_qso = pv.get('sigma_int_qso', 0.5)
+                        s_sne = s_qso
+                logL = _logL_mu_scatter(res, s_sne, s_qso)
+            else:
+                logL = _logL_mu(res, self.err_eff)
 
             if len(self.z_cc) > 0:
                 H_th = self.provider.get_Hubble(self.z_cc)
                 logL += -0.5 * (np.sum(((self.H_obs - H_th) / self.err_cc)**2) + self.norm_cc)
 
+            dmu_star = A * np.exp(-_Z_STAR / zd)
+            logL += _cmb_logL(self.provider, dmu_star)
             return logL
 
     # ================================================================
@@ -360,28 +537,21 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
     else:
         log_decay_params = {'A': None, 'zb': None, 'gamma_log_decay': None, 'zh': None,
                             'mabs': None}
+    if _fit_scatter:
+        if combined_mode:
+            log_decay_params['sigma_int_sne'] = None
+            log_decay_params['sigma_int_qso'] = None
+        else:
+            if has_sne:
+                log_decay_params['sigma_int_sne'] = None
+            else:
+                log_decay_params['sigma_int_qso'] = None
 
     class GammaCDM_LOG_DECAY_Likelihood(Likelihood):
         """
         γCDM-LOG²-DECAY: Two-component additive damped correction.
 
         Δμ(z) = A·exp(-z/zb) + γ₀·[ln(1+z)]²·exp(-z/zh)
-
-        The local component A·exp(-z/zb) provides a calibration shift at z≈0,
-        while γ₀·[ln(1+z)]²·exp(-z/zh) captures long-range distance modulus
-        anomalies. Both terms decay to zero at high redshift, preserving
-        consistency with CMB observations.
-
-        Parameters
-        ----------
-        A : float
-            Amplitude of the local exponential component.
-        zb : float
-            Decay scale of the local component (small: local effect).
-        gamma_log_decay : float
-            Amplitude of the logarithmic-squared component.
-        zh : float
-            Decay scale of the logarithmic component (large: long-range).
         """
         params = log_decay_params
 
@@ -398,9 +568,13 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             self.restrict_m = restrict_m
 
         def get_requirements(self):
-            reqs = {"angular_diameter_distance": {"z": np.concatenate([self.z_mu, self.z_cc])}}
+            _zall = np.concatenate([self.z_mu, self.z_cc, _z_req_cmb])
+            reqs = {"angular_diameter_distance": {"z": _zall}}
             if len(self.z_cc) > 0:
                 reqs["Hubble"] = {"z": self.z_cc}
+            if _use_cmb:
+                reqs["H0"] = None
+                reqs["omegam"] = None
             return reqs
 
         def logp(self, **pv):
@@ -410,13 +584,18 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             except Exception:
                 return -1e30
 
-            A  = pv.get('A', 0.0)
-            zb = pv.get('zb', 0.1)
             g0 = pv.get('gamma_log_decay', 0.0)
             zh = pv.get('zh', 10.0)
 
-            # Two-component additive correction
-            local_term = A * np.exp(-self.z_mu / zb)
+            # Two-component additive correction (--no-bubble suppresses local term)
+            if no_bubble:
+                local_term = 0.0
+                dmu_star_local = 0.0
+            else:
+                A  = pv.get('A', 0.0)
+                zb = pv.get('zb', 0.1)
+                local_term = A * np.exp(-self.z_mu / zb)
+                dmu_star_local = A * np.exp(-_Z_STAR / zb)
             long_range = g0 * np.log1p(self.z_mu)**2 * np.exp(-self.z_mu / zh)
             corr = local_term + long_range
 
@@ -430,12 +609,28 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 else:
                     mu_th = mu_th + pv.get('mabs', 0.0)
 
-            logL = _logL_mu(self.mu_obs - mu_th, self.err_eff)
+            res = self.mu_obs - mu_th
+            if _fit_scatter:
+                if self.combined:
+                    s_sne = pv.get('sigma_int_sne', 0.1)
+                    s_qso = pv.get('sigma_int_qso', 0.5)
+                else:
+                    if has_sne:
+                        s_sne = pv.get('sigma_int_sne', 0.1)
+                        s_qso = s_sne
+                    else:
+                        s_qso = pv.get('sigma_int_qso', 0.5)
+                        s_sne = s_qso
+                logL = _logL_mu_scatter(res, s_sne, s_qso)
+            else:
+                logL = _logL_mu(res, self.err_eff)
 
             if len(self.z_cc) > 0:
                 H_th = self.provider.get_Hubble(self.z_cc)
                 logL += -0.5 * (np.sum(((self.H_obs - H_th) / self.err_cc)**2) + self.norm_cc)
 
+            dmu_star = dmu_star_local + g0 * np.log1p(_Z_STAR)**2 * np.exp(-_Z_STAR / zh)
+            logL += _cmb_logL(self.provider, dmu_star)
             return logL
 
     return (LCDMLikelihood, GammaCDM_LOG2_Likelihood,
