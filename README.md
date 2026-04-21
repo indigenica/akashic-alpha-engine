@@ -24,12 +24,12 @@ $$\Delta\mu(z) = A \cdot e^{-z/z_b} + \gamma_0 \cdot [\ln(1+z)]^2 \cdot e^{-z/z_
 |-----------|-------|----------------|
 | A | −0.175 | Local bubble amplitude (mag) |
 | z_b | 0.40 | Bubble decay scale |
-| γ₀ | −0.807 | Kerr geometry coefficient |
-| z_h | 41.8 | Horizon damping scale |
+| γ₀ | −0.796 | Kerr geometry coefficient |
+| z_h | 56.2 | Horizon damping scale |
 | H₀ | 67.4 (fixed) | Planck anchor |
-| Ωm | 0.338 | Matter density |
+| Ωm | 0.325 | Matter density |
 
-**Key result:** H₀(local) = 67.4 × 10^(0.035) = **73.05 km/s/Mpc** — matching SH0ES to 0.1%.
+**Key result:** H₀(local) = 67.4 × 10^(0.035) = **73.06 km/s/Mpc** — matching SH0ES to 0.1%.
 
 ### Model Evolution
 
