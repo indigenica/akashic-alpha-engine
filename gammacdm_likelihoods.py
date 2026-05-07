@@ -547,11 +547,16 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
             else:
                 log_decay_params['sigma_int_qso'] = None
 
-    class GammaCDM_LOG_DECAY_Likelihood(Likelihood):
+    class GammaCDM_LOG_DECAY_Likelihood_base(Likelihood):
+        exponent = 2 # default
         """
         γCDM-LOG²-DECAY: Two-component additive damped correction.
 
         Δμ(z) = A·exp(-z/zb) + γ₀·[ln(1+z)]²·exp(-z/zh)
+
+        γCDM-LOG³-DECAY: Two-component additive damped correction.
+
+        Δμ(z) = A·exp(-z/zb) + γ₀·[ln(1+z)]³·exp(-z/zh)
         """
         params = log_decay_params
 
@@ -596,7 +601,7 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 zb = pv.get('zb', 0.1)
                 local_term = A * np.exp(-self.z_mu / zb)
                 dmu_star_local = A * np.exp(-_Z_STAR / zb)
-            long_range = g0 * np.log1p(self.z_mu)**2 * np.exp(-self.z_mu / zh)
+            long_range = g0 * np.log1p(self.z_mu)**self.exponent * np.exp(-self.z_mu / zh)
             corr = local_term + long_range
 
             mu_th = 5 * np.log10(np.maximum(dl, 1e-10)) + 25 + corr
@@ -629,9 +634,15 @@ def create_likelihoods(z_mu, mu_obs, err_mu, z_cc, H_obs, err_cc,
                 H_th = self.provider.get_Hubble(self.z_cc)
                 logL += -0.5 * (np.sum(((self.H_obs - H_th) / self.err_cc)**2) + self.norm_cc)
 
-            dmu_star = dmu_star_local + g0 * np.log1p(_Z_STAR)**2 * np.exp(-_Z_STAR / zh)
+            dmu_star = dmu_star_local + g0 * np.log1p(_Z_STAR)**self.exponent * np.exp(-_Z_STAR / zh)
             logL += _cmb_logL(self.provider, dmu_star)
             return logL
 
+    class GammaCDM_LOG_DECAY_Likelihood(GammaCDM_LOG_DECAY_Likelihood_base):
+        exponent = 2
+
+    class GammaCDM_LOG_CUBED_DECAY_Likelihood(GammaCDM_LOG_DECAY_Likelihood_base):
+        exponent = 3
+
     return (LCDMLikelihood, GammaCDM_LOG2_Likelihood,
-            DecayLikelihood, GammaCDM_LOG_DECAY_Likelihood)
+            DecayLikelihood, GammaCDM_LOG_DECAY_Likelihood, GammaCDM_LOG_CUBED_DECAY_Likelihood)

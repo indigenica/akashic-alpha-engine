@@ -6,7 +6,7 @@ Avoids MPI_FINALIZE issue by running in isolated process.
 Usage:
     python run_nested_single.py <model> --nlive 100 --sigma-int-sne 0.1 --sigma-int-qso 0.4 --qso-err-cut 1.5
     
-    model: lcdm, log2
+    model: lcdm, log2, decay, log_decay
 """
 import argparse
 import json
@@ -94,6 +94,14 @@ else:
     df = pd.read_csv('https://raw.githubusercontent.com/indigenica/akashic-alpha-engine/main/' + dataset_name)
 
 # Filter and extract exactly as in gammacdm_verification.py
+_HAS_GROUP = 'group' in df.columns
+def _qso_z_mask(series):
+    """(z > z_min_qso) OR (group == 7).  Falls back to plain z-cut if no group column."""
+    mask = series['z'] > args.z_min_qso
+    if _HAS_GROUP:
+        mask = mask | (series['group'] == 7)
+    return mask
+
 sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min_sne)]
 cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')]
 
@@ -103,11 +111,13 @@ if args.no_quasars:
     COMBINED_MODE = False
 elif getattr(args, 'quasars_only', False):
     sne = pd.DataFrame(columns=df.columns)
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min_qso)]
+    _qso_base = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    qso = _qso_base[_qso_z_mask(_qso_base)]
     mu_data = qso.copy()
     COMBINED_MODE = False
 else:
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min_qso)]
+    _qso_base = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    qso = _qso_base[_qso_z_mask(_qso_base)]
     mu_data = pd.concat([sne, qso])
     COMBINED_MODE = True
 
@@ -189,7 +199,7 @@ from gammacdm_likelihoods import create_likelihoods
 _cov_ev = _cov_evals_nested
 _cov_ec = _cov_evecs_nested
 
-LCDMLikelihood, GammaCDM_LOG2_Likelihood, DecayLikelihood, LogDecayLikelihood = \
+LCDMLikelihood, GammaCDM_LOG2_Likelihood, DecayLikelihood, LogDecayLikelihood, LogCubedDecayLikelihood = \
     create_likelihoods(
         z_mu=z_mu, mu_obs=mu_obs, err_mu=err_mu,
         z_cc=z_cc, H_obs=H_obs, err_cc=err_cc,
@@ -489,7 +499,7 @@ if args.model == "log2":
     beta = abs(g_val) * np.log(10) / 5
     alpha = beta / 2
     spin = np.sqrt(1 - ((1 - alpha) / (1 + alpha))**2) if alpha < 1 else 1.0
-    print(f"   🌀 Spin Implied: a/M = {spin:.4f}")
+    print(f"   🌀 Heuristic Spin: a/M = {spin:.4f}")
 elif args.model == "decay":
     a_val = results['A_mean']
     a_err = results['A_std']
@@ -517,7 +527,7 @@ elif args.model == "log_decay":
     beta = abs(g_val) * np.log(10) / 5
     alpha = beta / 2
     spin = np.sqrt(1 - ((1 - alpha) / (1 + alpha))**2) if alpha < 1 else 1.0
-    print(f"   🌀 Spin Implied: a/M = {spin:.4f}")
+    print(f"   🌀 Heuristic Spin: a/M = {spin:.4f}")
     # Local H0 from bubble component (strict z→0 limit)
     h0_loc = h0_local(H0_mean, A=a_val, z_b=zb_val,
                       gamma_0=g_val, z_h=zh_val, z_pivot=Z_PIVOT)

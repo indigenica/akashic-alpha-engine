@@ -280,16 +280,16 @@ parser.add_argument("--no-quasars", action="store_true", dest="no_quasars",
                     help="Exclude quasars (SNe + CC only)")
 parser.add_argument("--quasars-only", "--quasars", action="store_true", dest="quasars_only",
                     help="Use quasars only (high-z test)")
-parser.add_argument("--qso-err-cut", type=float, default=1.5, dest="qso_err_cut",
-                    help="Max quasar error to include (default: 1.5 mag)")
-parser.add_argument("--sne-err-cut", type=float, default=0.5, dest="sne_err_cut",
-                    help="Max supernova error to include (default: 0.5 mag)")
+parser.add_argument("--qso-err-cut", type=float, default=3.0, dest="qso_err_cut",
+                    help="Max quasar error to include (default: 3.0 mag)")
+parser.add_argument("--sne-err-cut", type=float, default=3.0, dest="sne_err_cut",
+                    help="Max supernova error to include (default: 3.0 mag)")
 parser.add_argument("--z-min-sne", type=float, default=0.01, dest="z_min_sne",
                     help="Minimum redshift to include SNe (default: 0.01, removes local peculiar velocities)")
 parser.add_argument("--z-max-sne", type=float, default=2.5, dest="z_max_sne",
                     help="Maximum redshift to include SNe (default: 2.5, Pantheon+ max)")
-parser.add_argument("--z-min-qso", type=float, default=0.0, dest="z_min_qso",
-                    help="Minimum redshift to include QSO (default: 0.0, recommended 0.7 for cosmological fits)")
+parser.add_argument("--z-min-qso", type=float, default=0.7, dest="z_min_qso",
+                    help="Minimum redshift to include QSO (default: 0.7, recommended for cosmological fits)")
 parser.add_argument("--revised", action="store_true",
                     help="Use full_dataset_revisado.csv instead of full_dataset.csv")
 parser.add_argument("--asymmetric", action="store_true",
@@ -298,10 +298,10 @@ parser.add_argument("--mock", action="store_true",
                     help="Run γ=0 null test (verify pipeline doesn't fabricate signal)")
 parser.add_argument("--n-mock", type=int, default=20, dest="n_mock",
                     help="Number of mock realizations (default: 20)")
-parser.add_argument("--sigma-int-qso", type=float, default=0.4, dest="sigma_int_qso",
-                    help="QSO intrinsic scatter to add in quadrature (default: 0.4, try 0.3-0.6)")
-parser.add_argument("--sigma-int-sne", type=float, default=0.1, dest="sigma_int_sne",
-                    help="SNe Ia intrinsic scatter (default: 0.1, for Pantheon+ without cov)")
+parser.add_argument("--sigma-int-qso", type=float, default=1.44, dest="sigma_int_qso",
+                    help="QSO intrinsic scatter to add in quadrature (default: 1.44, 0.4 for amplification)")
+parser.add_argument("--sigma-int-sne", type=float, default=0.012, dest="sigma_int_sne",
+                    help="SNe Ia intrinsic scatter (default: 0.012, for Pantheon+ with cov)")
 parser.add_argument("--nested", action="store_true",
                     help="Use PolyChord nested sampling instead of MCMC (computes true Bayes factor)")
 parser.add_argument("--nlive", type=int, default=200,
@@ -316,7 +316,7 @@ parser.add_argument("--legacy", action="store_true", help="Include legacy models
 parser.add_argument("--student", action="store_true", help="Use Student-t likelihood (robust to outliers, default ν=5)")
 parser.add_argument("--cauchy", action="store_true", help="Use Cauchy likelihood (ν=1, maximum robustness)")
 parser.add_argument("--nu", type=float, default=5.0, help="Degrees of freedom for Student-t (default: 5.0)")
-parser.add_argument("--cov", type=str, default="none", choices=["none", "stat", "sys"],
+parser.add_argument("--cov", type=str, default="sys", choices=["none", "stat", "sys"],
                     help="Covariance matrix type for SNe Ia (default: 'none', 'stat' for STATONLY, 'sys' for STAT+SYS)")
 parser.add_argument("--evo", action="store_true",
                     help="Use differential_evolution global optimizer instead of random-restart Nelder-Mead")
@@ -332,14 +332,14 @@ parser.add_argument("--sh0es", action="store_true",
                     help="Add SH0ES local H0 prior (73.04 ± 1.04) to penalty")
 parser.add_argument("--no-bubble", action="store_true", dest="no_bubble",
                     help="Test LOG²-Decay without local bubble: Δμ = γ₀·[ln(1+z)]²·exp(-z/z_h) only (Kerr-Only / Occam test)")
-parser.add_argument("--paper", action="store_true",
-                    help="Publication-ready output: strip emojis, pin cosmetic formatting, silence advisory lines")
 parser.add_argument("--snapshot-chi2", type=str, default=None, dest="snapshot_chi2",
                     help="Regression hook: compute χ² for a fixed set of parameter vectors "
                          "against all 12 chi2_* functions AND exit before the MLE loop. "
                          "Writes a JSON to the given path. Use this before and after a refactor "
                          "to verify bit-compatibility: python test_regression.py --validate.")
-
+parser.add_argument("--loowaic", action="store_true",
+                    help="Halt execution immediately after initialization (data load, covariance, CAMB grid). "
+                         "Intended for use with waic_analysis.py to avoid running MLE/MCMC loops.")
 # ── BAO / DESI DR1 options (Stage 7) ────────────────────────────────────────
 # Two mutually exclusive modes:
 #   --bao       : DESI DR1 enters the joint likelihood (SNe+QSO+CC+CMB+BAO).
@@ -364,35 +364,6 @@ _bao_group.add_argument("--bao-null", action="store_true", dest="bao_null",
                          "consistency. Does NOT change the MLE results, only adds a "
                          "diagnostic table.")
 args = parser.parse_args()
-
-
-# ── Publication-ready output hook (--paper) ─────────────────────────────────
-# When --paper is active we wrap builtins.print to strip emoji code points.
-# This is a post-processing hook; existing print(...) calls throughout the
-# file stay untouched. The regex matches the Unicode pictograph ranges
-# commonly used for emojis and symbol sets found in the current output.
-if args.paper:
-    import builtins as _builtins
-    import re as _re
-    # Strip decorative pictographs while preserving structural punctuation
-    # (arrows ← → ↔, en/em dashes, Greek letters, math symbols).
-    _EMOJI_RE = _re.compile(
-        "["
-        "\U0001F300-\U0001FAFF"     # Pictographs / extended symbols
-        "\U00002700-\U000027BF"     # Dingbats
-        "\U0001F600-\U0001F64F"     # Emoticons
-        "\U0001F680-\U0001F6FF"     # Transport & map
-        "\u2705\u2714\u2716\u274C\u26A0\u26A1\u2728\u2B50"  # ✅✔✖❌⚠⚡✨⭐
-        "]",
-        flags=_re.UNICODE,
-    )
-    _orig_print = _builtins.print
-    def _paper_print(*objs, **kwargs):
-        cleaned = [_EMOJI_RE.sub("", o) if isinstance(o, str) else o for o in objs]
-        _orig_print(*cleaned, **kwargs)
-    _builtins.print = _paper_print
-# ────────────────────────────────────────────────────────────────────────────
-
 
 # ============================================================================
 # LOAD DATA
@@ -459,13 +430,26 @@ sne_all['cov_idx'] = np.arange(len(sne_all))
 df.loc[df['probe'] == 'sne_ia', 'cov_idx'] = sne_all['cov_idx'].values
 
 
+# Helper: quasar redshift mask that always keeps group-7 (Risaliti clean AGN)
+# even when z_min_qso would otherwise exclude them.
+_HAS_GROUP = 'group' in df.columns
+def _qso_z_mask(series):
+    """(z > z_min_qso) OR (group == 7).  Falls back to plain z-cut if no group column."""
+    mask = series['z'] > args.z_min_qso
+    if _HAS_GROUP:
+        mask = mask | (series['group'] == 7)
+    return mask
+
 if args.quasars_only:
     # ── QUASARS ONLY (high-z test) ──
-    print(f"\n🔭 MODE: Quasars only (high-z test, err < {args.qso_err_cut}, z > {args.z_min_qso})")
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min_qso)]
+    _qso_base = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    qso = _qso_base[_qso_z_mask(_qso_base)]
+    _n_g7 = int((qso['group'] == 7).sum()) if _HAS_GROUP else 0
+    _g7_tag = f" + {_n_g7} group-7" if _n_g7 > 0 else ""
+    print(f"\n🔭 MODE: Quasars only (high-z test, err < {args.qso_err_cut}, z > {args.z_min_qso}{_g7_tag})")
 
     print(f"\n📊 Dataset:")
-    print(f"   Quasars: {len(qso)} pts (μ observable, err < {args.qso_err_cut}, z > {args.z_min_qso})")
+    print(f"   Quasars: {len(qso)} pts (μ observable, err < {args.qso_err_cut}, z > {args.z_min_qso}{_g7_tag})")
     print(f"   z range: {qso['z'].min():.2f} – {qso['z'].max():.2f}")
     print(f"   ⟨σ⟩ = {qso['err'].mean():.2f} mag")
 
@@ -508,7 +492,10 @@ else:
     # ── DEFAULT: SNe Ia (err < cut) + Quasars (err < cut) + CC ──
     sne = df[(df['probe'] == 'sne_ia') & (df['type'] == 'mu') & (df['err'] < args.sne_err_cut) & (df['z'] > args.z_min_sne) & (df['z'] < args.z_max_sne)]
     cc = df[(df['probe'] == 'cc') & (df['type'] == 'H')] if not args.no_cc else df.iloc[0:0]
-    qso = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut) & (df['z'] > args.z_min_qso)]
+    _qso_base = df[(df['probe'] == 'quasar') & (df['type'] == 'mu') & (df['err'] < args.qso_err_cut)]
+    qso = _qso_base[_qso_z_mask(_qso_base)]
+    _n_g7 = int((qso['group'] == 7).sum()) if _HAS_GROUP else 0
+    _g7_tag = f" + {_n_g7} group-7" if _n_g7 > 0 else ""
 
     n_sne = len(sne)
     n_qso = len(qso)
@@ -519,10 +506,10 @@ else:
     sne_mask[:n_sne] = True
     qso_mask = ~sne_mask
 
-    print(f"\n🔭 MODE: SNe Ia (err < {args.sne_err_cut}, {args.z_min_sne} < z < {args.z_max_sne}) + Quasars (err < {args.qso_err_cut}, z > {args.z_min_qso}) + CC")
+    print(f"\n🔭 MODE: SNe Ia (err < {args.sne_err_cut}, {args.z_min_sne} < z < {args.z_max_sne}) + Quasars (err < {args.qso_err_cut}, z > {args.z_min_qso}{_g7_tag}) + CC")
     print(f"\n📊 Dataset:")
     print(f"   SNe Ia:   {n_sne} pts (μ, err < {args.sne_err_cut}, {args.z_min_sne} < z < {args.z_max_sne})")
-    print(f"   Quasars:  {n_qso} pts (μ, err < {args.qso_err_cut}, z > {args.z_min_qso})")
+    print(f"   Quasars:  {n_qso} pts (μ, err < {args.qso_err_cut}, z > {args.z_min_qso}{_g7_tag})")
     print(f"   CC:       {len(cc)} pts (H){' [EXCLUDED]' if args.no_cc else ''}")
     print(f"   Total μ:  {len(mu_data)} pts")
     print(f"   z range:  {mu_data['z'].min():.2f} – {mu_data['z'].max():.2f}")
@@ -842,6 +829,11 @@ def _neg2logL_fit_scatter(residuals, sig_int_sne, sig_int_qso):
 # ============================================================================
 # PRE-TABULATED CAMB BACKGROUND (120×80 grid → ~40s setup, ~300× faster evals)
 # ============================================================================
+# IMPORTANT: The main grid (mu_base, hz, da_star) is ALWAYS built identically
+# regardless of --bao / --bao-null flags. BAO extras (rdrag, D_M, D_H at DESI
+# z_eff) live in a completely separate grid with its own cache file, so that
+# --bao-null never contaminates the MLE objective.
+# ============================================================================
 if args.camb_tab:
     _N_H0_GRID, _N_OMCH2_GRID = 120, 80
     _h0_grid = np.linspace(H0_MIN, H0_MAX, _N_H0_GRID)
@@ -850,10 +842,8 @@ if args.camb_tab:
     import time as _time
     _t0_tab = _time.time()
 
-    # Cache file name reflects whether BAO extras (rdrag + D_M/D_H at DESI z_eff)
-    # are required. This avoids invalidating the standard cache when users run
-    # without --bao / --bao-null, and keeps BAO runs hot.
-    _cache_file = "camb_grid_cache_bao.npz" if NEED_BAO_BG else "camb_grid_cache.npz"
+    # ── Main grid (SNe + CC + CMB) — never touches BAO ──────────────────────
+    _cache_file = "camb_grid_cache.npz"
     _loaded_cache = False
 
     if os.path.exists(_cache_file):
@@ -862,43 +852,22 @@ if args.camb_tab:
                 _mu_base_table = data["mu_base"]
                 _hz_table = data["hz"] if "hz" in data else None
                 _da_star_table = data["da_star"]
-                if NEED_BAO_BG:
-                    _rdrag_table = data["rdrag"] if "rdrag" in data else None
-                    _dm_bao_table = data["dm_bao"] if "dm_bao" in data else None
-                    _dh_bao_table = data["dh_bao"] if "dh_bao" in data else None
-                else:
-                    _rdrag_table = _dm_bao_table = _dh_bao_table = None
 
                 _shape_ok = _mu_base_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(z_mu))
                 _hz_ok = (_hz_table is None
                           or _hz_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(z_cc)))
-                _bao_ok = (not NEED_BAO_BG) or (
-                    _rdrag_table is not None
-                    and _rdrag_table.shape == (_N_H0_GRID, _N_OMCH2_GRID)
-                    and _dm_bao_table is not None
-                    and _dm_bao_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI))
-                    and _dh_bao_table is not None
-                    and _dh_bao_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI))
-                )
-                if _shape_ok and _hz_ok and _bao_ok:
+                if _shape_ok and _hz_ok:
                     _loaded_cache = True
                     print(f"\n⚡ Cargando grid CAMB desde caché ({_cache_file})...")
         except Exception:
             pass
 
     if not _loaded_cache:
-        _bao_suffix = " +rdrag/D_M/D_H(DESI z_eff)" if NEED_BAO_BG else ""
-        print(f"\n⏳ Pre-tabulando CAMB background ({_N_H0_GRID}×{_N_OMCH2_GRID} grid){_bao_suffix}...")
+        print(f"\n⏳ Pre-tabulando CAMB background ({_N_H0_GRID}×{_N_OMCH2_GRID} grid)...")
 
         _mu_base_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(z_mu)))
         _hz_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(z_cc))) if len(z_cc) > 0 else None
         _da_star_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID))
-        if NEED_BAO_BG:
-            _rdrag_table  = np.empty((_N_H0_GRID, _N_OMCH2_GRID))
-            _dm_bao_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI)))
-            _dh_bao_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI)))
-        else:
-            _rdrag_table = _dm_bao_table = _dh_bao_table = None
 
         for _i_h0, _h0_val in enumerate(_h0_grid):
             for _j_oc, _oc_val in enumerate(_omch2_grid):
@@ -908,10 +877,6 @@ if args.camb_tab:
                     if _hz_table is not None:
                         _hz_table[_i_h0, _j_oc, :] = np.nan
                     _da_star_table[_i_h0, _j_oc] = np.nan
-                    if NEED_BAO_BG:
-                        _rdrag_table[_i_h0, _j_oc] = np.nan
-                        _dm_bao_table[_i_h0, _j_oc, :] = np.nan
-                        _dh_bao_table[_i_h0, _j_oc, :] = np.nan
                     continue
                 try:
                     _pars_tab = camb.CAMBparams()
@@ -925,24 +890,11 @@ if args.camb_tab:
                     if _hz_table is not None:
                         _hz_table[_i_h0, _j_oc, :] = _r_tab.hubble_parameter(z_cc)
                     _da_star_table[_i_h0, _j_oc] = _r_tab.angular_diameter_distance(Z_STAR)
-                    if NEED_BAO_BG:
-                        # D_M(z) = comoving radial distance (flat FRW); D_H(z) = c/H(z).
-                        _dm_bao_table[_i_h0, _j_oc, :] = _r_tab.comoving_radial_distance(Z_EFF_DESI)
-                        _dh_bao_table[_i_h0, _j_oc, :] = C_LIGHT_KMS / _r_tab.hubble_parameter(Z_EFF_DESI)
-                        # r_d from CAMB derived params (sound horizon at drag, Mpc)
-                        try:
-                            _rdrag_table[_i_h0, _j_oc] = _r_tab.get_derived_params()["rdrag"]
-                        except Exception:
-                            _rdrag_table[_i_h0, _j_oc] = np.nan
                 except Exception:
                     _mu_base_table[_i_h0, _j_oc, :] = np.nan
                     if _hz_table is not None:
                         _hz_table[_i_h0, _j_oc, :] = np.nan
                     _da_star_table[_i_h0, _j_oc] = np.nan
-                    if NEED_BAO_BG:
-                        _rdrag_table[_i_h0, _j_oc] = np.nan
-                        _dm_bao_table[_i_h0, _j_oc, :] = np.nan
-                        _dh_bao_table[_i_h0, _j_oc, :] = np.nan
 
         # Fill non-physical NaN cells with nearest physical neighbor so cubic
         # spline construction gets all-finite values.  The chi² functions already
@@ -959,21 +911,12 @@ if args.camb_tab:
             if _hz_table is not None:
                 for _kz in range(_hz_table.shape[2]):
                     _hz_table[:, :, _kz] = _hz_table[:, :, _kz][tuple(_nn_idx)]
-            if NEED_BAO_BG:
-                _rdrag_table = _rdrag_table[tuple(_nn_idx)]
-                for _kz in range(_dm_bao_table.shape[2]):
-                    _dm_bao_table[:, :, _kz] = _dm_bao_table[:, :, _kz][tuple(_nn_idx)]
-                    _dh_bao_table[:, :, _kz] = _dh_bao_table[:, :, _kz][tuple(_nn_idx)]
             print(f"   📐 {_n_nan} non-physical grid cells padded (nearest-neighbor)")
 
         try:
             _save_kwargs = {"mu_base": _mu_base_table, "da_star": _da_star_table}
             if _hz_table is not None:
                 _save_kwargs["hz"] = _hz_table
-            if NEED_BAO_BG:
-                _save_kwargs["rdrag"]  = _rdrag_table
-                _save_kwargs["dm_bao"] = _dm_bao_table
-                _save_kwargs["dh_bao"] = _dh_bao_table
             np.savez(_cache_file, **_save_kwargs)
             print(f"   💾 Grid guardado exitosamente en {_cache_file}")
         except Exception as e:
@@ -993,7 +936,86 @@ if args.camb_tab:
         (_h0_grid, _omch2_grid), _da_star_table,
         method='cubic', bounds_error=False, fill_value=None,
     )
+
+    _dt_tab = _time.time() - _t0_tab
+    print(f"   ✅ Tabla CAMB (principal) construida en {_dt_tab:.1f}s "
+      f"({_N_H0_GRID}×{_N_OMCH2_GRID} = {_N_H0_GRID*_N_OMCH2_GRID} puntos)")
+
+    # ── BAO grid (rdrag, D_M, D_H at DESI z_eff) — fully independent ────────
+    # Built lazily only when --bao or --bao-null is active. Has its own cache
+    # file and its own NaN-padding. Never affects _mu_base_interp.
+    _rdrag_interp = _dm_bao_interp = _dh_bao_interp = None
     if NEED_BAO_BG:
+        _t0_bao = _time.time()
+        _bao_cache_file = "camb_bao_grid_cache.npz"
+        _loaded_bao_cache = False
+
+        if os.path.exists(_bao_cache_file):
+            try:
+                with np.load(_bao_cache_file) as data:
+                    _rdrag_table  = data["rdrag"]
+                    _dm_bao_table = data["dm_bao"]
+                    _dh_bao_table = data["dh_bao"]
+                    _bao_ok = (
+                        _rdrag_table.shape == (_N_H0_GRID, _N_OMCH2_GRID)
+                        and _dm_bao_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI))
+                        and _dh_bao_table.shape == (_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI))
+                    )
+                    if _bao_ok:
+                        _loaded_bao_cache = True
+                        print(f"\n⚡ Cargando grid BAO desde caché ({_bao_cache_file})...")
+            except Exception:
+                pass
+
+        if not _loaded_bao_cache:
+            print(f"\n⏳ Pre-tabulando BAO background (rdrag/D_M/D_H at DESI z_eff, {_N_H0_GRID}×{_N_OMCH2_GRID})...")
+            _rdrag_table  = np.empty((_N_H0_GRID, _N_OMCH2_GRID))
+            _dm_bao_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI)))
+            _dh_bao_table = np.empty((_N_H0_GRID, _N_OMCH2_GRID, len(Z_EFF_DESI)))
+
+            for _i_h0, _h0_val in enumerate(_h0_grid):
+                for _j_oc, _oc_val in enumerate(_omch2_grid):
+                    _Om_check = (_oc_val + OMBH2_FIDUCIAL) / (_h0_val / 100) ** 2
+                    if _Om_check <= 0.0:
+                        _rdrag_table[_i_h0, _j_oc] = np.nan
+                        _dm_bao_table[_i_h0, _j_oc, :] = np.nan
+                        _dh_bao_table[_i_h0, _j_oc, :] = np.nan
+                        continue
+                    try:
+                        _pars_bao = camb.CAMBparams()
+                        _pars_bao.WantTransfer = False
+                        _pars_bao.WantCls = False
+                        _pars_bao.set_cosmology(H0=_h0_val, ombh2=OMBH2_FIDUCIAL, omch2=_oc_val)
+                        _r_bao = camb.get_background(_pars_bao)
+                        _dm_bao_table[_i_h0, _j_oc, :] = _r_bao.comoving_radial_distance(Z_EFF_DESI)
+                        _dh_bao_table[_i_h0, _j_oc, :] = C_LIGHT_KMS / _r_bao.hubble_parameter(Z_EFF_DESI)
+                        try:
+                            _rdrag_table[_i_h0, _j_oc] = _r_bao.get_derived_params()["rdrag"]
+                        except Exception:
+                            _rdrag_table[_i_h0, _j_oc] = np.nan
+                    except Exception:
+                        _rdrag_table[_i_h0, _j_oc] = np.nan
+                        _dm_bao_table[_i_h0, _j_oc, :] = np.nan
+                        _dh_bao_table[_i_h0, _j_oc, :] = np.nan
+
+            # Independent NaN-padding for the BAO grid
+            _nan_mask_bao = np.isnan(_rdrag_table)
+            _n_nan_bao = int(np.sum(_nan_mask_bao))
+            if _n_nan_bao > 0:
+                from scipy.ndimage import distance_transform_edt
+                _, _nn_idx_bao = distance_transform_edt(_nan_mask_bao, return_indices=True)
+                _rdrag_table = _rdrag_table[tuple(_nn_idx_bao)]
+                for _kz in range(_dm_bao_table.shape[2]):
+                    _dm_bao_table[:, :, _kz] = _dm_bao_table[:, :, _kz][tuple(_nn_idx_bao)]
+                    _dh_bao_table[:, :, _kz] = _dh_bao_table[:, :, _kz][tuple(_nn_idx_bao)]
+                print(f"   📐 {_n_nan_bao} non-physical BAO grid cells padded (nearest-neighbor)")
+
+            try:
+                np.savez(_bao_cache_file, rdrag=_rdrag_table, dm_bao=_dm_bao_table, dh_bao=_dh_bao_table)
+                print(f"   💾 Grid BAO guardado exitosamente en {_bao_cache_file}")
+            except Exception as e:
+                print(f"   ⚠️ No se pudo guardar caché BAO: {e}")
+
         _rdrag_interp = RegularGridInterpolator(
             (_h0_grid, _omch2_grid), _rdrag_table,
             method='cubic', bounds_error=False, fill_value=None,
@@ -1006,12 +1028,8 @@ if args.camb_tab:
             (_h0_grid, _omch2_grid), _dh_bao_table,
             method='cubic', bounds_error=False, fill_value=None,
         )
-    else:
-        _rdrag_interp = _dm_bao_interp = _dh_bao_interp = None
-
-    _dt_tab = _time.time() - _t0_tab
-    print(f"   ✅ Tabla CAMB construida en {_dt_tab:.1f}s "
-      f"({_N_H0_GRID}×{_N_OMCH2_GRID} = {_N_H0_GRID*_N_OMCH2_GRID} puntos)")
+        _dt_bao = _time.time() - _t0_bao
+        print(f"   ✅ Tabla BAO construida en {_dt_bao:.1f}s")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1079,9 +1097,7 @@ def _chi2_tail(H0, omch2, correction_arr,
     """
     global GLOBAL_CHI2
     try:
-        mu_th_base, _hz_pred, _da_star, _bao_extras = _fast_camb_bg(
-            H0, omch2, want_bao=USE_BAO_FIT
-        )
+        mu_th_base, _hz_pred, _da_star = _fast_camb_bg(H0, omch2)
         if mu_th_base is None:
             return 1e10
 
@@ -1120,17 +1136,19 @@ def _chi2_tail(H0, omch2, correction_arr,
 
         # ── BAO (DESI DR1) likelihood term ──────────────────────────────────
         # Only active when --bao is passed (USE_BAO_FIT). For --bao-null the
-        # diagnostic is computed post-fit (see `_bao_null_test_report`),
+        # diagnostic is computed post-fit (see BAO REPORTING section),
         # preserving bit-exact MLE results.
-        if USE_BAO_FIT and _bao_extras is not None:
-            dm_zeff = _bao_extras["dm"]
-            dh_zeff = _bao_extras["dh"]
-            if BAO_PROPAGATE_CORRECTION and bao_correction_zeff is not None:
-                # D_M_model / r_d = (D_M_ΛCDM · 10^(Δμ/5)) / r_d
-                dm_zeff = dm_zeff * (10.0 ** (bao_correction_zeff / 5.0))
-            chi2_bao, _ = compute_chi2_bao(dm_zeff, dh_zeff, _bao_extras["rdrag"])
-            total += chi2_bao
-            GLOBAL_CHI2 += chi2_bao
+        if USE_BAO_FIT:
+            _bao_extras = _fast_bao_bg(H0, omch2)
+            if _bao_extras is not None:
+                dm_zeff = _bao_extras["dm"]
+                dh_zeff = _bao_extras["dh"]
+                if BAO_PROPAGATE_CORRECTION and bao_correction_zeff is not None:
+                    # D_M_model / r_d = (D_M_ΛCDM · 10^(Δμ/5)) / r_d
+                    dm_zeff = dm_zeff * (10.0 ** (bao_correction_zeff / 5.0))
+                chi2_bao, _ = compute_chi2_bao(dm_zeff, dh_zeff, _bao_extras["rdrag"])
+                total += chi2_bao
+                GLOBAL_CHI2 += chi2_bao
         return total
     except Exception as e:
         CAMB_ERRORS.record(e)
@@ -1160,8 +1178,10 @@ def _bao_corr_at(z_arr, kind, *,
         return gamma_0 * np.log(1.0 + z) ** 3
     if kind == "decay":
         return A * np.exp(-z / zd)
-    if kind == "log_decay":
+    if kind == "log2_decay":
         return A * np.exp(-z / z_b) + gamma_0 * np.log(1.0 + z) ** 2 * np.exp(-z / z_h)
+    if kind == "log3_decay":
+        return A * np.exp(-z / z_b) + gamma_0 * np.log(1.0 + z) ** 3 * np.exp(-z / z_h)
     raise ValueError(f"Unknown correction kind: {kind!r}")
 
 
@@ -1172,16 +1192,11 @@ def _bao_corr_if_fit(kind, **kwargs):
     return _bao_corr_at(Z_EFF_DESI, kind, **kwargs)
 
 
-def _fast_camb_bg(H0, omch2, want_bao=False):
+def _fast_camb_bg(H0, omch2):
     """Interpolated CAMB background OR on-the-fly exact computation.
 
-    Returns (mu_base, hz_pred, da_star, bao_extras).
-
-    When `want_bao` is False (default), `bao_extras` is None and the BAO
-    arrays are never computed — no extra CAMB work and no interpolator call.
-    When `want_bao` is True, `bao_extras` is a dict
-        {"rdrag": float, "dm": (7,) ndarray, "dh": (7,) ndarray}
-    with D_M and D_H evaluated at Z_EFF_DESI [Mpc].
+    Returns (mu_base, hz_pred, da_star).  Never touches BAO arrays.
+    BAO extras live in the independent `_fast_bao_bg` function.
     """
     if args.camb_tab:
         pt = np.array([[H0, omch2]])
@@ -1189,16 +1204,8 @@ def _fast_camb_bg(H0, omch2, want_bao=False):
         hz_pred = np.ravel(_hz_interp(pt)) if _hz_interp is not None else np.array([])
         da_star = float(_da_star_interp(pt))
         if np.any(np.isnan(mu_base)) or np.isnan(da_star):
-            return None, None, None, None
-        bao_extras = None
-        if want_bao and _rdrag_interp is not None:
-            rdrag = float(_rdrag_interp(pt))
-            dm = np.ravel(_dm_bao_interp(pt))
-            dh = np.ravel(_dh_bao_interp(pt))
-            if np.isnan(rdrag) or np.any(np.isnan(dm)) or np.any(np.isnan(dh)):
-                return None, None, None, None
-            bao_extras = {"rdrag": rdrag, "dm": dm, "dh": dh}
-        return mu_base, hz_pred, da_star, bao_extras
+            return None, None, None
+        return mu_base, hz_pred, da_star
     else:
         try:
             pars_tab = camb.CAMBparams()
@@ -1209,20 +1216,47 @@ def _fast_camb_bg(H0, omch2, want_bao=False):
             mu_base = 5.0 * np.log10(np.maximum(r_tab.luminosity_distance(z_mu), 1e-10)) + 25.0
             hz_pred = r_tab.hubble_parameter(z_cc) if len(z_cc) > 0 else np.array([])
             da_star = r_tab.angular_diameter_distance(Z_STAR)
-            bao_extras = None
-            if want_bao:
-                dm = r_tab.comoving_radial_distance(Z_EFF_DESI)
-                dh = C_LIGHT_KMS / r_tab.hubble_parameter(Z_EFF_DESI)
-                try:
-                    rdrag = float(r_tab.get_derived_params()["rdrag"])
-                except Exception:
-                    rdrag = float("nan")
-                if np.isnan(rdrag):
-                    return None, None, None, None
-                bao_extras = {"rdrag": rdrag, "dm": dm, "dh": dh}
-            return mu_base, hz_pred, da_star, bao_extras
+            return mu_base, hz_pred, da_star
         except Exception:
-            return None, None, None, None
+            return None, None, None
+
+
+def _fast_bao_bg(H0, omch2):
+    """BAO background (rdrag, D_M, D_H at DESI z_eff) — fully independent.
+
+    Returns dict {"rdrag": float, "dm": ndarray, "dh": ndarray} or None.
+    Uses the separate BAO interpolation grid when --camb-tab is active,
+    otherwise falls back to an on-the-fly CAMB call.  Never touches the
+    mu_base / hz / da_star arrays used by the MLE objective.
+    """
+    if args.camb_tab:
+        if _rdrag_interp is None:
+            return None
+        pt = np.array([[H0, omch2]])
+        rdrag = float(_rdrag_interp(pt))
+        dm = np.ravel(_dm_bao_interp(pt))
+        dh = np.ravel(_dh_bao_interp(pt))
+        if np.isnan(rdrag) or np.any(np.isnan(dm)) or np.any(np.isnan(dh)):
+            return None
+        return {"rdrag": rdrag, "dm": dm, "dh": dh}
+    else:
+        try:
+            pars = camb.CAMBparams()
+            pars.WantTransfer = False
+            pars.WantCls = False
+            pars.set_cosmology(H0=H0, ombh2=OMBH2_FIDUCIAL, omch2=omch2)
+            r = camb.get_background(pars)
+            dm = r.comoving_radial_distance(Z_EFF_DESI)
+            dh = C_LIGHT_KMS / r.hubble_parameter(Z_EFF_DESI)
+            try:
+                rdrag = float(r.get_derived_params()["rdrag"])
+            except Exception:
+                return None
+            if np.isnan(rdrag):
+                return None
+            return {"rdrag": rdrag, "dm": dm, "dh": dh}
+        except Exception:
+            return None
 
 
 def chi2_lcdm(params):
@@ -1597,7 +1631,13 @@ def chi2_decay_no_M(params):
 # =============================================================================
 
 def chi2_gcdm_log_decay(params):
-    """γCDM-LOG²-DECAY with optional --fit-scatter, --cmb, --no-bubble."""
+    return chi2_gcdm_log_decay_base(params, exponent=2)
+
+def chi2_gcdm_log_cubed_decay(params):
+    return chi2_gcdm_log_decay_base(params, exponent=3)
+
+def chi2_gcdm_log_decay_base(params, exponent=2):
+    """γCDM-LOG²-DECAY: Δμ = A·exp(-z/z_b) + γ₀·[ln(1+z)]²·exp(-z/z_h)."""
     params = list(params)
     _sig_sne, _sig_qso, _ok = _extract_fit_scatter(params, supported=True)
     if not _ok:
@@ -1692,12 +1732,12 @@ def chi2_gcdm_log_decay(params):
 
     # Two-component additive correction in redshift space.
     bubble_term = (A * np.exp(-z_mu / z_b)) if _use_bubble else 0.0
-    kerr_term = gamma_0 * np.log(1 + z_mu) ** 2 * np.exp(-z_mu / z_h)
+    kerr_term = gamma_0 * np.log(1 + z_mu) ** exponent * np.exp(-z_mu / z_h)
     unified_corr = bubble_term + kerr_term
 
     # Same model evaluated at z* for the CMB shift-parameter penalty.
     bubble_star = (A * np.exp(-Z_STAR / z_b)) if _use_bubble else 0.0
-    delta_mu_star = bubble_star + gamma_0 * np.log(1 + Z_STAR) ** 2 * np.exp(-Z_STAR / z_h)
+    delta_mu_star = bubble_star + gamma_0 * np.log(1 + Z_STAR) ** exponent * np.exp(-Z_STAR / z_h)
 
     H0_loc = H0 if not _use_bubble else h0_local(H0, A=A, z_b=z_b, z_pivot=Z_PIVOT)
 
@@ -1713,12 +1753,18 @@ def chi2_gcdm_log_decay(params):
         use_m_penalty=True,
         H0_local=H0_loc,
         bao_correction_zeff=_bao_corr_if_fit(
-            "log_decay", A=_A_bao, z_b=_zb_bao, gamma_0=gamma_0, z_h=z_h
+            f"log{exponent}_decay", A=_A_bao, z_b=_zb_bao, gamma_0=gamma_0, z_h=z_h
         ),
     )
 
 
 def chi2_gcdm_log_decay_no_M(params):
+    return chi2_gcdm_log_decay_no_M_base(params, exponent=2)
+
+def chi2_gcdm_log_cubed_decay_no_M(params):
+    return chi2_gcdm_log_decay_no_M_base(params, exponent=3)
+
+def chi2_gcdm_log_decay_no_M_base(params, exponent=2):
     """γCDM-LOG²-DECAY sin M: Δμ = A·exp(-z/z_b) + γ₀·[ln(1+z)]²·exp(-z/z_h)."""
     if args.fixed_anchor or args.sanity_check:
         omch2, A, z_b, gamma_0, z_h = params
@@ -1737,7 +1783,7 @@ def chi2_gcdm_log_decay_no_M(params):
     if not check_physical_prior(H0, omch2):
         return 1e10
 
-    corr = A * np.exp(-z_mu / z_b) + gamma_0 * np.log(1 + z_mu) ** 2 * np.exp(-z_mu / z_h)
+    corr = A * np.exp(-z_mu / z_b) + gamma_0 * np.log(1 + z_mu) ** exponent * np.exp(-z_mu / z_h)
 
     # NOTE: the _no_M variant intentionally does NOT apply the CMB shift
     # penalty (this mirrors the original pre-refactor behavior; see
@@ -1746,7 +1792,7 @@ def chi2_gcdm_log_decay_no_M(params):
         H0, omch2, corr,
         H0_local=h0_local(H0, A=A, z_b=z_b, z_pivot=Z_PIVOT),
         bao_correction_zeff=_bao_corr_if_fit(
-            "log_decay", A=A, z_b=z_b, gamma_0=gamma_0, z_h=z_h
+            f"log{exponent}_decay", A=A, z_b=z_b, gamma_0=gamma_0, z_h=z_h
         ),
     )
 
@@ -1761,6 +1807,10 @@ def chi2_gcdm_log_decay_no_M(params):
 # for ANY entry, the refactor is numerically not bit-compatible and must be
 # debugged.
 # ============================================================================
+if args.loowaic:
+    print("✓ Initialization complete. Halting early because --loowaic was specified.")
+    sys.exit(0)
+
 if args.snapshot_chi2 is not None:
     import json as _json
     import sys as _sys
@@ -1860,18 +1910,22 @@ models_to_fit = [
 models_to_fit += [
     {"name": "γCDM-LOG²", "fn": chi2_gcdm_log_squared, "type": "evolving", "corr_kind": "log2"},
     {"name": "γCDM-Decay", "fn": chi2_decay, "type": "decay", "corr_kind": "decay"},
-    {"name": "γCDM-LOG²-Decay", "fn": chi2_gcdm_log_decay, "type": "log_decay", "corr_kind": "log_decay"},
+    {"name": "γCDM-LOG²-Decay", "fn": chi2_gcdm_log_decay, "type": "log_decay", "corr_kind": "log2_decay"},
 ]
 # Legacy models: only include with --legacy flag
 if args.legacy:
     models_to_fit += [
+        {"name": "γCDM", "fn": chi2_gcdm, "type": "gcdm", "corr_kind": "gcdm"},
         {"name": "γCDM-LINEAL", "fn": chi2_gcdm_linear, "type": "evolving", "corr_kind": "linear"},
         {"name": "γCDM-LOG³", "fn": chi2_gcdm_log_cubed, "type": "evolving", "corr_kind": "log3"},
+        {"name": "γCDM-LOG³-Decay", "fn": chi2_gcdm_log_cubed_decay, "type": "log_decay", "corr_kind": "log3_decay"},
     ]
 
 if args.asymmetric or args.sanity_check:
     # Use no-M variants: ΛCDM keeps M, γCDM/Decay lose M entirely
     for m in models_to_fit:
+        if m["name"] == "γCDM":
+            m["fn"] = chi2_gcdm_no_M
         if m["name"] == "γCDM-LINEAL":
             m["fn"] = chi2_gcdm_linear_no_M
         elif m["name"] == "γCDM-LOG²":
@@ -1882,9 +1936,11 @@ if args.asymmetric or args.sanity_check:
             m["fn"] = chi2_decay_no_M
         elif m["name"] == "γCDM-LOG²-Decay":
             m["fn"] = chi2_gcdm_log_decay_no_M
+        elif m["name"] == "γCDM-LOG³-Decay":
+            m["fn"] = chi2_gcdm_log_cubed_decay_no_M
 
 results = []
-best_overall_bic = np.inf
+best_overall_aic = np.inf
 best_overall_model = None
 
 np.random.seed(42)
@@ -2359,9 +2415,30 @@ for model in models_to_fit:
         
         omc = om - 0.0224 / (h0 / 100)**2
         omch2 = om * (h0 / 100.0)**2 - OMBH2_FIDUCIAL
+        # Extracción desglosada de M_sne y M_qso
+        M_sne_out = M
+        M_qso_out = M
+        _fixed_m = (args.sanity_check or args.no_nuisance or args.asymmetric) and mtype != "lcdm"
+        if _fixed_m:
+            M_sne_out = 0.0
+            M_qso_out = 0.0
+        else:
+            idx_start = 1 if (args.fixed_anchor or (args.sanity_check and mtype == "lcdm")) else 2
+            if COMBINED_MODE:
+                M_sne_out = best_params[idx_start]
+                M_qso_out = best_params[idx_start + 1]
+            else:
+                if getattr(args, "quasars_only", False):
+                    M_sne_out = 0.0
+                    M_qso_out = best_params[idx_start]
+                else:
+                    M_sne_out = best_params[idx_start]
+                    M_qso_out = 0.0
+
         _res_entry = {
             "name": name, "mtype": mtype, "corr_kind": corr_kind,
-            "H0": h0, "Om": om, "Omc": omc, "Omch2": omch2, "M": M, "gamma": gamma,
+            "H0": h0, "Om": om, "Omc": omc, "Omch2": omch2, "M": M, 
+            "M_sne": M_sne_out, "M_qso": M_qso_out, "gamma": gamma,
             "chi2": best_chi2, "bic": bic, "aic": aic,
             "params": best_params, "n_eff": n_eff,
             "sig_sne": fitted_sig_sne, "sig_qso": fitted_sig_qso
@@ -2373,8 +2450,8 @@ for model in models_to_fit:
             _res_entry.update({"A": A, "zd": zd})
         results.append(_res_entry)
         
-        if bic < best_overall_bic:
-            best_overall_bic = bic
+        if aic < best_overall_aic:
+            best_overall_aic = aic
             best_overall_model = results[-1]
 
 # Baseline ΛCDM for deltas
@@ -2451,10 +2528,10 @@ if NEED_BAO_BG and results:
             h0 = res["H0"]
             om = res["Om"]
             omch2 = res["Omch2"]
-            # CAMB background at best-fit (with BAO extras)
-            _mu_bg, _hz_bg, _da_bg, _bao_ex = _fast_camb_bg(h0, omch2, want_bao=True)
+            # BAO background at best-fit (independent grid)
+            _bao_ex = _fast_bao_bg(h0, omch2)
             if _bao_ex is None:
-                print(f"   {res['name']:<24} {'—':>10} {'—':>8} {'—':>8} {om:>8.3f} {h0:>8.2f}   (CAMB failed)")
+                print(f"   {res['name']:<24} {'—':>10} {'—':>8} {'—':>8} {om:>8.3f} {h0:>8.2f}   (BAO bg failed)")
                 continue
             _dm = _bao_ex["dm"]
             _dh = _bao_ex["dh"]
@@ -2468,7 +2545,7 @@ if NEED_BAO_BG and results:
                 _kw = {"gamma_0": res.get("gamma", 0.0)}
             elif _kind == "decay":
                 _kw = {"A": res.get("A", 0.0), "zd": res.get("zd", 1.0)}
-            elif _kind == "log_decay":
+            elif _kind in ("log2_decay", "log3_decay"):
                 _A = 0.0 if res.get("no_bubble") else res.get("A", 0.0)
                 _zb = res.get("z_b", 1.0) or 1.0
                 _kw = {
@@ -2507,16 +2584,17 @@ if not os.path.exists(args.output_dir):
 # Find models with best BIC
 res_log2 = next((r for r in results if r["name"] == "γCDM-LOG²"), None)
 res_lcdm = next((r for r in results if r["name"] == "ΛCDM"), None)
-res_gcdm = next((r for r in results if r["name"] == "γCDM (const)"), None)
+res_gcdm = next((r for r in results if r["name"] == "γCDM"), None)
 res_lin = next((r for r in results if r["name"] == "γCDM-LINEAL"), None)
 res_log3 = next((r for r in results if r["name"] == "γCDM-LOG³"), None)
 res_decay = next((r for r in results if r["name"] == "γCDM-Decay"), None)
 res_log_decay = next((r for r in results if r["name"] == "γCDM-LOG²-Decay"), None)
+res_log3_decay = next((r for r in results if r["name"] == "γCDM-LOG³-Decay"), None)
 
 if results:
     best_model_aic = min(results, key=lambda x: x["aic"])
     print(f"\n🏆 MEJOR MODELO (AIC): {best_model_aic['name']} (AIC = {best_model_aic['aic']:.1f})")
-    print(f"   H₀ (mejor BIC) = {best_overall_model['H0']:.2f} km/s/Mpc")
+    print(f"   H₀ (mejor AIC) = {best_overall_model['H0']:.2f} km/s/Mpc")
 else:
     print(f"\n🏆 MEJOR MODELO (AIC): N/A (MLE Skipped)")
 
@@ -2592,50 +2670,6 @@ if best_overall_model and lcdm_res:
         print(f"   ✅ Valores de δM consistentes → γ₀ NO absorbe el offset")
     else:
         print(f"   ⚠️  δM difieren significativamente")
-
-# Spin Calculation — use best AIC model's γ₀
-# Works for any model that has a 'gamma' key (LOG², LOG²-Decay, etc.)
-best_aic_model = min(results, key=lambda x: x["aic"]) if results else None
-spin_gamma = None
-spin_model_name = None
-if best_aic_model and 'gamma' in best_aic_model:
-    spin_gamma = best_aic_model['gamma']
-    spin_model_name = best_aic_model['name']
-elif res_log2:
-    spin_gamma = res_log2['gamma']
-    spin_model_name = res_log2['name']
-
-if spin_gamma is not None and spin_gamma != 0:
-    print("\n" + "=" * 70)
-    print("🌀 CÁLCULO DE SPIN — Container Black Hole")
-    print("=" * 70)
-    print(f"""
-   La corrección γ₀·[ln(1+z)]² (del modelo {spin_model_name}) se interpreta
-   dentro de la hipótesis Möbius-Kerr: habitamos el interior conformalmente
-   invertido y finito de un agujero negro rotante (Container).
-
-   Para un agujero negro de Kerr:
-     • Ratio de horizontes: α = r₋/r₊
-     • Para LOG²: β = |γ₀| × ln(10)/5
-     • Hipótesis: α = |β|/2
-""")
-    beta = abs(spin_gamma) * np.log(10) / 5
-    alpha = beta / 2
-    x = (1 - alpha) / (1 + alpha)
-    spin = np.sqrt(1 - x**2) if x**2 <= 1 else 0.0
-
-    print(f"   📐 CÁLCULO (modelo: {spin_model_name}):")
-    print(f"   γ₀ = {spin_gamma:.4f}")
-    print(f"   β = {beta:.4f}, α = {alpha:.4f}")
-    print(f"   a/M = √(1 − ((1−α)/(1+α))²) = {spin:.4f}")
-
-    print(f"\n   📊 RESULTADO:")
-    print(f"   Container Spin ({spin_model_name}):  a/M ≈ {spin:.2f}")
-
-    print(f"\n   🔬 INTERPRETACIÓN HIPOTÉTICA:")
-    print(f"   Mayor spin → mayor frame-dragging → lensing cuadrático con decay → container rotante finito")
-    if spin > 0.6:
-        print(f"   Consistente con spins observados en BH supermasivos (0.7–0.9)")
 
 # ============================================================================
 # COMPATIBILITY VARIABLES FOR SUMMARY
@@ -3001,7 +3035,7 @@ if args.mcmc or args.nested:
 
         # ── Import Likelihood classes from shared module ──
         from gammacdm_likelihoods import create_likelihoods
-        LCDMLikelihood, GammaCDM_LOG2_Likelihood, DecayLikelihood, GammaCDM_LOG_DECAY_Likelihood = \
+        LCDMLikelihood, GammaCDM_LOG2_Likelihood, DecayLikelihood, GammaCDM_LOG_DECAY_Likelihood, GammaCDM_LOG_CUBED_DECAY_Likelihood = \
             create_likelihoods(
                 z_mu=z_mu, mu_obs=mu_obs, err_mu=err_mu,
                 z_cc=z_cc, H_obs=H_obs, err_cc=err_cc,
@@ -4012,3 +4046,78 @@ print(CHI2_ERRORS.summary())
 #     por este lensing geométrico con límites (Container Kerr Metric).
 
 print("=" * 70)
+
+# ============================================================================
+# CSV EXPORT
+# ============================================================================
+import csv
+
+csv_path = "logs/experiments_results.csv"
+file_exists = os.path.isfile(csv_path)
+
+# Prepare common execution arguments
+common_row = {
+    "Timestamp": SESSION_TIMESTAMP,
+    "z_min_sne": args.z_min_sne,
+    "z_max_sne": args.z_max_sne,
+    "z_min_qso": args.z_min_qso,
+    "sne_err_cut": args.sne_err_cut,
+    "qso_err_cut": args.qso_err_cut,
+    "cov": args.cov,
+    "likelihood": LIKELIHOOD_TYPE,
+    "sig_int_sne_input": args.sigma_int_sne,
+    "sig_int_qso_input": args.sigma_int_qso,
+    "fit_scatter": args.fit_scatter,
+    "no_bubble": getattr(args, 'no_bubble', False),
+    "fixed_anchor": args.fixed_anchor,
+    "asymmetric": args.asymmetric,
+    "no_nuisance": args.no_nuisance,
+    "sanity_check": args.sanity_check,
+    "no_quasars": getattr(args, 'no_quasars', False),
+    "quasars_only": getattr(args, 'quasars_only', False),
+    "penalty_m": getattr(args, 'penalty_m', False),
+    "cmb": getattr(args, 'cmb', False),
+}
+
+csv_columns = list(common_row.keys()) + [
+    "Model", "H0", "Om", "Omc", "Omch2", "M_sne", "M_qso", "M_mean", "gamma", "A", "z_b", "z_h", "zd",
+    "neg2logL", "n_eff", "BIC", "AIC", "delta_BIC", "delta_AIC", "chi2_bao", "chi2_bao_red", "rdrag_bao"
+]
+
+try:
+    with open(csv_path, mode="a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        if not file_exists:
+            writer.writeheader()
+        
+        for res in results:
+            row = dict(common_row)
+            row.update({
+                "Model": res["name"],
+                "H0": f"{res.get('H0', 0):.4f}",
+                "Om": f"{res.get('Om', 0):.4f}",
+                "Omc": f"{res.get('Omc', 0):.4f}",
+                "Omch2": f"{res.get('Omch2', 0):.4f}",
+                "M_sne": f"{res.get('M_sne', 0):.4f}",
+                "M_qso": f"{res.get('M_qso', 0):.4f}",
+                "M_mean": f"{res.get('M', 0):.4f}",
+                "gamma": f"{res.get('gamma', 0):.4f}",
+                "A": f"{res.get('A', 0):.4f}",
+                "z_b": f"{res.get('z_b', 0):.4f}",
+                "z_h": f"{res.get('z_h', 0):.4f}",
+                "zd": f"{res.get('zd', 0):.4f}",
+                "neg2logL": f"{res.get('chi2', 0):.4f}",
+                "n_eff": res.get("n_eff", 0),
+                "BIC": f"{res.get('bic', 0):.4f}",
+                "AIC": f"{res.get('aic', 0):.4f}",
+                "delta_BIC": f"{res.get('bic', 0) - bic_lcdm:.4f}" if bic_lcdm else "0.0000",
+                "delta_AIC": f"{res.get('aic', 0) - aic_lcdm:.4f}" if aic_lcdm else "0.0000",
+                "chi2_bao": f"{res.get('chi2_bao', 0):.4f}",
+                "chi2_bao_red": f"{res.get('chi2_bao_red', 0):.4f}",
+                "rdrag_bao": f"{res.get('rdrag_bestfit', 0):.4f}"
+            })
+            writer.writerow(row)
+    print(f"   ✅ Resultados guardados en CSV: {csv_path}")
+except Exception as e:
+    print(f"   ⚠️ Error al guardar CSV: {e}")
+

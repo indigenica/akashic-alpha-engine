@@ -36,8 +36,8 @@ SH0ES_SIG = 1.04                    # 1-sigma uncertainty on local H0
 SH0ES_Z_PIVOT = 0.023               # Effective pivot redshift of Cepheid+SN sample
                                     # (set Z_PIVOT to 0.0 to recover the z→0 limit
                                     # H0_local = H0_cosmo · 10^(-A/5))
-#Z_PIVOT = SH0ES_Z_PIVOT
-Z_PIVOT = 0.0
+Z_PIVOT = SH0ES_Z_PIVOT
+# Z_PIVOT = 0.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIDUCIAL COSMOLOGY
