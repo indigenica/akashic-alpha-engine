@@ -14,6 +14,12 @@ The goal of this repository is verification, not methodological novelty.
 
 ---
 
+## Release Candidate (May 7, 2026)
+
+Earlier versions of this paper were exploratory. This release candidate establishes the canonical, statistically rigorous analysis and results.
+
+---
+
 ## LOG²-Decay Unification (Feb 23, 2026)
 
 The final model combines two independent components—a local bubble and a persistent geometric correction:
