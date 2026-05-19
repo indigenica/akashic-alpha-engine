@@ -14,6 +14,13 @@ The goal of this repository is verification, not methodological novelty.
 
 ---
 
+## Release Candidate (May 19, 2026)
+
+Availability Update for [v17](https://doi.org/10.5281/zenodo.20287622) 
+The complete code for the v17 analysis pipeline and SageManifolds tensor scripts is currently available upon request. Because the public repository has received zero community feedback or engagement to date, automatic public codebase updates have been paused. If you wish to review the codebase, run the pipeline, or collaborate on the theoretical framework, please reach out via email and I will gladly share the files with you.
+
+---
+
 ## Release Candidate (May 7, 2026)
 
 Earlier versions of this paper were exploratory. This release candidate establishes the canonical, statistically rigorous analysis and results.
